@@ -77,6 +77,39 @@ class PerformanceMetrics:
         return "\n".join(lines)
 
 
+@dataclass
+class TradeStats:
+    """Statistics for trades of a single ticker or aggregate."""
+    ticker: str
+    total_trades: int  # Number of completed round-trip trades
+    winning_trades: int
+    losing_trades: int
+    win_rate: float
+    total_pnl: float
+    avg_pnl: float
+    avg_win: float
+    avg_loss: float
+    profit_factor: float
+    max_win: float
+    max_loss: float
+    
+    def to_dict(self) -> dict:
+        return {
+            'Ticker': self.ticker,
+            'Total Trades': self.total_trades,
+            'Win Rate': f"{self.win_rate:.1%}",
+            'Winning': self.winning_trades,
+            'Losing': self.losing_trades,
+            'Total P&L': f"${self.total_pnl:,.0f}",
+            'Avg P&L': f"${self.avg_pnl:,.0f}",
+            'Avg Win': f"${self.avg_win:,.0f}",
+            'Avg Loss': f"${self.avg_loss:,.0f}",
+            'Profit Factor': f"{self.profit_factor:.2f}",
+            'Max Win': f"${self.max_win:,.0f}",
+            'Max Loss': f"${self.max_loss:,.0f}",
+        }
+
+
 def compute_cagr(equity_curve: pd.Series) -> float:
     """
     Compute compound annual growth rate.
@@ -409,3 +442,109 @@ def get_rolling_sharpe(
     rolling_std = returns.rolling(window).std()
     
     return (rolling_mean / rolling_std) * np.sqrt(252)
+
+
+def compute_trade_stats(trades: pd.DataFrame) -> pd.DataFrame:
+    """
+    Compute per-ticker trade statistics using FIFO matching.
+    
+    Args:
+        trades: DataFrame containing executed trades
+        
+    Returns:
+        DataFrame with trade statistics per ticker
+    """
+    if trades.empty:
+        return pd.DataFrame()
+        
+    stats_list = []
+    
+    # Process each ticker
+    for ticker, group in trades.groupby('ticker'):
+        # Sort by execution date (and usually signal date is prior)
+        group = group.sort_values('date')
+        
+        inventory = []  # List of (price, quantity) tuples
+        pnl_record = [] # List of realized PnL values for closed trades
+        
+        for _, row in group.iterrows():
+            side = row['side']
+            price = row['price']
+            qty = row['shares']
+            
+            if side == 'BUY':
+                inventory.append([price, qty])
+            elif side == 'SELL':
+                qty_to_sell = qty
+                cost_basis = 0.0
+                qty_sold_total = 0.0
+                
+                # FIFO matching
+                while qty_to_sell > 1e-6 and inventory:
+                    # Look at oldest lot
+                    lot = inventory[0]
+                    lot_price, lot_qty = lot
+                    
+                    if lot_qty > qty_to_sell:
+                        # Partial sell of the lot
+                        match_qty = qty_to_sell
+                        lot[1] -= match_qty # Update remaining qty in lot
+                        qty_to_sell = 0
+                    else:
+                        # Full sell of the lot
+                        match_qty = lot_qty
+                        qty_to_sell -= match_qty
+                        inventory.pop(0) # Remove exhausted lot
+                        
+                    cost_basis += match_qty * lot_price
+                    qty_sold_total += match_qty
+                
+                # If we sold something, record PnL
+                if qty_sold_total > 1e-6:
+                    revenue = qty_sold_total * price
+                    realized_pnl = revenue - cost_basis
+                    pnl_record.append(realized_pnl)
+        
+        # Calculate statistics
+        num_trades = len(pnl_record)
+        if num_trades == 0:
+            continue
+            
+        pnl_array = np.array(pnl_record)
+        winning = pnl_array[pnl_array > 0]
+        losing = pnl_array[pnl_array <= 0]
+        
+        wins = len(winning)
+        losses = len(losing)
+        
+        total_pnl = pnl_array.sum()
+        gross_win = winning.sum() if wins > 0 else 0.0
+        gross_loss = abs(losing.sum()) if losses > 0 else 0.0
+        
+        stats = TradeStats(
+            ticker=ticker,
+            total_trades=num_trades,
+            winning_trades=wins,
+            losing_trades=losses,
+            win_rate=wins / num_trades if num_trades > 0 else 0.0,
+            total_pnl=total_pnl,
+            avg_pnl=pnl_array.mean(),
+            avg_win=winning.mean() if wins > 0 else 0.0,
+            avg_loss=losing.mean() if losses > 0 else 0.0,
+            profit_factor=gross_win / gross_loss if gross_loss > 0 else float('inf'),
+            max_win=pnl_array.max(),
+            max_loss=pnl_array.min(),
+        )
+        stats_list.append(stats)
+    
+    if not stats_list:
+        return pd.DataFrame()
+        
+    # Sort by Total P&L descending
+    stats_list.sort(key=lambda x: x.total_pnl, reverse=True)
+    
+    # Convert to dicts
+    data = [s.to_dict() for s in stats_list]
+    
+    return pd.DataFrame(data)
+

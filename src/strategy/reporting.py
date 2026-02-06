@@ -21,6 +21,7 @@ from .backtest import BacktestResults
 from .metrics import (
     compute_metrics,
     compute_drawdown_series,
+    compute_trade_stats,
     get_monthly_returns,
     get_rolling_sharpe,
     PerformanceMetrics,
@@ -665,6 +666,9 @@ def generate_full_report(
     # Compute metrics
     metrics = compute_metrics(results)
     
+    # Compute trade stats
+    trade_stats = compute_trade_stats(results.trades)
+    
     # Generate charts
     charts = {}
     charts['equity'] = plot_equity_curve(
@@ -721,7 +725,7 @@ def generate_full_report(
     plt.close('all')
     
     # Generate HTML report
-    html = _generate_html_report(metrics, output_dir, stock_chart_paths)
+    html = _generate_html_report(metrics, output_dir, stock_chart_paths, trade_stats)
     
     report_path = output_dir / 'report.html'
     with open(report_path, 'w') as f:
@@ -735,10 +739,15 @@ def _generate_html_report(
     metrics: PerformanceMetrics,
     charts_dir: Path,
     stock_charts: list[Path] = [],
+    trade_stats: Optional[pd.DataFrame] = None,
 ) -> str:
     """Generate HTML report content."""
     
     metrics_html = generate_summary_table(metrics).to_html(index=False)
+    
+    trade_stats_html = ""
+    if trade_stats is not None and not trade_stats.empty:
+        trade_stats_html = trade_stats.to_html(index=False, border=0)
     
     timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     
@@ -760,7 +769,9 @@ def _generate_html_report(
             body {{ font-family: Arial, sans-serif; margin: 40px; }}
             h1 {{ color: #333; }}
             h2 {{ color: #666; border-bottom: 1px solid #ddd; padding-bottom: 10px; }}
-            table {{ border-collapse: collapse; width: 400px; margin: 20px 0; }}
+            h1 {{ color: #333; }}
+            h2 {{ color: #666; border-bottom: 1px solid #ddd; padding-bottom: 10px; }}
+            table {{ border-collapse: collapse; margin: 20px 0; }}
             th, td {{ border: 1px solid #ddd; padding: 8px; text-align: left; }}
             th {{ background-color: #f4f4f4; }}
             img {{ max-width: 100%; margin: 20px 0; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }}
@@ -773,6 +784,11 @@ def _generate_html_report(
         
         <h2>Performance Summary</h2>
         {metrics_html}
+        
+        <h2>Ticker Trade Statistics</h2>
+        <div style="max-height: 500px; overflow-y: auto;">
+        {trade_stats_html}
+        </div>
         
         <h2>Combined Performance</h2>
         <img src="equity_drawdown_combined.png" alt="Combined Performance">
