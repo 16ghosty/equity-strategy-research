@@ -1,0 +1,44 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environment
+.venv/
+venv/
+ENV/
+
+# Data cache
+data/cache/
+data/*.parquet
+data/*.csv
+!data/.gitkeep
+!data/tickers.txt
+
+# Reports output
+reports/output/*.png
+reports/output/*.html
+reports/output/*.csv
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Testing
+.coverage
+htmlcov/
+.pytest_cache/
+
+# Build
+*.egg-info/
+dist/
+build/
