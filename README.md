@@ -12,6 +12,8 @@ This repository implements a momentum-based equity strategy with:
 - **Portfolio Construction**: Equal-weight or inverse-vol weighting with constraints
 - **Buffer Logic**: Hysteresis for entry/exit to reduce turnover
 - **T+1 Execution**: Realistic fills at next-day open with slippage costs
+- **Cash Sweep Controls**: Optional idle-cash sweep to benchmark or T-bill proxy
+- **Experiment Toggles**: Rebalance scheduling, no-trade band, and beta-target overlay
 
 ## Key Features
 
@@ -25,7 +27,7 @@ This repository implements a momentum-based equity strategy with:
 - Deterministic random seeds
 - Data cached to Parquet files
 - All parameters in a single configuration dataclass
-- Full test coverage with 131 unit tests
+- Full test coverage with 169 unit tests
 
 ### Modularity
 - Clean separation of concerns across modules
@@ -56,6 +58,7 @@ equity_strategy/
 │       ├── reporting.py    # Charts and HTML reports
 │       ├── analysis.py     # Stress + sensitivity runner
 │       ├── validation.py   # Training/validation tail-risk suite
+│       ├── wandb_utils.py  # W&B logging helpers
 │       └── main.py         # CLI runner
 ├── tests/                  # Unit tests
 └── reports/
@@ -109,9 +112,9 @@ config = StrategyConfig(
     ticker_file="data/tickers.txt",
     start_date="2020-01-01",
     end_date="2024-12-31",
-    top_k=20,           # Number of positions
-    buffer=5,           # Exit buffer
-    momentum_lookback=60,
+    top_k=10,           # Number of positions
+    buffer=25,          # Exit buffer
+    momentum_lookback=120,
     momentum_skip=5,
     slippage_bps=10,
 )
@@ -155,6 +158,11 @@ All parameters are centralized in `StrategyConfig`:
 | `vol_cap` | 0.60 | Max annualized volatility |
 | `weight_scheme` | "equal" | "equal" or "inverse_vol" |
 | `max_weight` | 0.10 | Max single position weight |
+| `rebalance_frequency` | "daily" | "daily", "weekly", or "custom" |
+| `min_trade_weight_change` | 0.0 | No-trade band threshold (weight delta) |
+| `beta_targeting_enabled` | false | Enable beta-target stock sleeve scaling |
+| `cash_sweep_to_benchmark` | true | Sweep idle cash into benchmark/T-bill stream |
+| `cash_sweep_asset` | "benchmark" | Sweep asset: `"benchmark"` or `"tbill"` |
 | `slippage_bps` | 10 | Slippage in basis points |
 | `execution_delay` | 1 | Days delay for execution (T+1) |
 
@@ -243,12 +251,19 @@ Generated HTML reports include:
 - Daily turnover analysis
 - Daily return distribution
 - Negative-tail distribution (<= 5th percentile)
+- Benchmark diagnostics (up/down capture, alpha/beta decomposition)
+- Turnover vs performance by year (scatter + table)
+- Cost drag by year and rebalance event costs
+- Ticker health table (per-stock contribution metrics)
+- Recent drawdown detractor table + chart
+- Worst 20 trades table
 
-## Weights & Biases (Optional)
+## Weights & Biases
 
 W&B integration is available for both:
 - `strategy.main` (primary backtest runs)
 - `strategy.analysis` (stress tests and parameter sensitivity runs)
+- `strategy.validation` (training/validation tail-risk suite)
 
 Setup:
 
@@ -278,8 +293,19 @@ python -m strategy.validation \
 
 Notes:
 - Keep API keys in environment variables only.
-- Default mode is online. Use `--wandb-mode offline` for deferred syncing.
+- W&B logging is enabled by default; default mode is online.
+- Use `--no-wandb` to disable logging.
+- Use `--wandb-mode offline` for deferred syncing.
 - Offline runs can be synced later with `wandb sync`.
+
+## Experiment Presets
+
+Preset configs for method comparisons are in `configs/experiments/`:
+- `baseline_control.json` (current baseline control)
+- `method1_schedule_hybrid.json` (scheduled rebalance + daily exits)
+- `method2_no_trade_band.json` (no-trade band threshold)
+- `method3_stronger_buffer.json` (stronger hysteresis buffer)
+- `method4_beta_target_overlay.json` (beta-target stock sleeve overlay)
 
 ## Testing
 
@@ -300,7 +326,7 @@ pytest tests/ --cov=src/strategy --cov-report=html
 - [x] Signals at day T use only data available at day T close
 - [x] Execution at day T+1 open (not same day)
 - [x] No look-ahead in feature calculations
-- [x] All tests pass (131 unit tests)
+- [x] All tests pass (169 unit tests)
 - [x] Reproducible results with fixed random seed
 
 ## License
