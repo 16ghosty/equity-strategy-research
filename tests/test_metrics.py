@@ -17,6 +17,11 @@ from strategy.metrics import (
     compute_max_drawdown,
     compute_drawdown_series,
     compute_volatility,
+    compute_var,
+    compute_expected_shortfall,
+    compute_cdar,
+    compute_worst_period_return,
+    compute_tail_ratio,
     compute_turnover_stats,
     compute_avg_holding_period,
     compute_cost_ratio,
@@ -200,6 +205,44 @@ class TestCostRatio:
         assert ratio == float('inf')
 
 
+class TestTailMetrics:
+    """Tests for tail-risk metrics."""
+
+    def test_var_es_ordering(self):
+        """ES should be no better than VaR at same confidence."""
+        np.random.seed(123)
+        returns = pd.Series(np.random.normal(0.0005, 0.02, 1000))
+        var95 = compute_var(returns, confidence=0.95)
+        es95 = compute_expected_shortfall(returns, confidence=0.95)
+        var99 = compute_var(returns, confidence=0.99)
+        es99 = compute_expected_shortfall(returns, confidence=0.99)
+
+        assert es95 <= var95
+        assert es99 <= var99
+        assert var99 <= var95
+
+    def test_cdar_is_negative_when_drawdowns_exist(self):
+        equity = pd.Series(
+            [100, 110, 90, 95, 80, 120],
+            index=pd.date_range("2024-01-01", periods=6, freq="B")
+        )
+        drawdowns = compute_drawdown_series(equity)
+        cdar95 = compute_cdar(drawdowns, confidence=0.95)
+        assert cdar95 <= 0
+
+    def test_worst_period_returns(self):
+        returns = pd.Series([0.01, -0.02, 0.03, -0.10, 0.02, -0.01, 0.01])
+        worst_1d = compute_worst_period_return(returns, window=1)
+        worst_5d = compute_worst_period_return(returns, window=5)
+        assert worst_1d == pytest.approx(-0.10)
+        assert worst_5d <= 0
+
+    def test_tail_ratio_positive(self):
+        returns = pd.Series([-0.04, -0.02, -0.01, 0.01, 0.02, 0.03, 0.05])
+        ratio = compute_tail_ratio(returns)
+        assert ratio > 0
+
+
 class TestPerformanceMetrics:
     """Tests for PerformanceMetrics dataclass."""
     
@@ -225,4 +268,6 @@ class TestPerformanceMetrics:
         d = metrics.to_dict()
         assert 'CAGR' in d
         assert 'Sharpe Ratio' in d
+        assert 'ES (95%)' in d
+        assert 'CDaR (95%)' in d
         assert d['CAGR'] == "15.00%"

@@ -16,6 +16,8 @@ from .execution import ExecutionModel
 from .backtest import Backtester, BacktestResults
 from .metrics import compute_metrics, PerformanceMetrics
 from .reporting import generate_full_report
+from .analysis import run_stress_tests, run_parameter_sensitivity
+from .validation import run_validation_suite
 
 __version__ = "0.1.0"
 
@@ -49,4 +51,8 @@ __all__ = [
     "PerformanceMetrics",
     # Reporting
     "generate_full_report",
+    # Analysis
+    "run_stress_tests",
+    "run_parameter_sensitivity",
+    "run_validation_suite",
 ]

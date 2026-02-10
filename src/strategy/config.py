@@ -7,7 +7,7 @@ All tunable parameters are defined here for reproducibility and easy experimenta
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Optional
 import logging
 
 
@@ -47,12 +47,33 @@ class StrategyConfig:
         weight_scheme: 'equal' or 'inverse_vol'
         max_weight: Maximum single-name weight
         max_gross_exposure: Maximum gross exposure (1.0 for long-only)
+        sector_cap_enabled: If True, cap aggregate exposure by sector
+        sector_cap: Maximum weight allowed per sector
+        sector_map_file: Optional CSV/JSON mapping file (ticker->sector)
+        beta_cap_enabled: If True, cap portfolio beta exposure
+        beta_cap: Maximum allowed portfolio beta (long-only weighted beta)
+        beta_lookback_days: Lookback window for rolling beta estimation
+        drawdown_scaler_enabled: If True, scale exposure down during deep drawdowns
+        drawdown_scaler_start: Drawdown level where de-risking starts (negative)
+        drawdown_scaler_full: Drawdown level where minimum exposure is reached (negative)
+        drawdown_scaler_min: Minimum exposure scale in deep drawdown
         
         # Execution settings
         slippage_bps: Fixed slippage in basis points per trade
         use_atr_slippage: If True, use ATR-based slippage model
         atr_slippage_mult: Multiplier for ATR slippage (fraction of ATR)
         execution_delay: Days between signal and execution (1 = t+1 open)
+        rebalance_frequency: Rebalance cadence ('daily' or 'weekly')
+        rebalance_weekday: Weekday for weekly rebalance (0=Mon ... 4=Fri)
+        bad_fills_enabled: If True, increase slippage on high-volatility days
+        bad_fills_vol_threshold: Annualized benchmark vol threshold for bad fills
+        bad_fills_multiplier: Slippage multiplier applied on bad-fill days
+        randomize_ranks: If True, randomize cross-sectional ranks (edge sanity test)
+        randomize_ranks_seed: Seed for rank randomization
+        cash_sweep_to_benchmark: If True, apply sweep-asset return to positive idle cash
+        cash_sweep_asset: Sweep asset for positive idle cash ('benchmark' or 'tbill')
+        cash_sweep_tbill_ticker: T-bill proxy ticker used when cash_sweep_asset='tbill'
+        cash_sweep_risk_off_to_cash: If True, keep idle cash uninvested during risk-off regime
         
         # Backtest settings
         initial_capital: Starting portfolio value
@@ -92,12 +113,33 @@ class StrategyConfig:
     weight_scheme: Literal["equal", "inverse_vol"] = "equal"
     max_weight: float = 0.10  # 10% max single name
     max_gross_exposure: float = 1.0
+    sector_cap_enabled: bool = False
+    sector_cap: float = 0.35
+    sector_map_file: Optional[Path] = None
+    beta_cap_enabled: bool = False
+    beta_cap: float = 1.20
+    beta_lookback_days: int = 63
+    drawdown_scaler_enabled: bool = False
+    drawdown_scaler_start: float = -0.08
+    drawdown_scaler_full: float = -0.20
+    drawdown_scaler_min: float = 0.35
     
     # Execution settings
     slippage_bps: float = 10.0
     use_atr_slippage: bool = False
     atr_slippage_mult: float = 0.1  # 10% of daily ATR
     execution_delay: int = 1  # t+1 execution
+    rebalance_frequency: Literal["daily", "weekly"] = "daily"
+    rebalance_weekday: int = 0  # Monday
+    bad_fills_enabled: bool = False
+    bad_fills_vol_threshold: float = 0.35
+    bad_fills_multiplier: float = 2.0
+    randomize_ranks: bool = False
+    randomize_ranks_seed: int = 42
+    cash_sweep_to_benchmark: bool = True
+    cash_sweep_asset: Literal["benchmark", "tbill"] = "benchmark"
+    cash_sweep_tbill_ticker: str = "BIL"
+    cash_sweep_risk_off_to_cash: bool = True
     
     # Backtest settings
     initial_capital: float = 1_000_000.0
@@ -113,6 +155,8 @@ class StrategyConfig:
             self.ticker_file = Path(self.ticker_file)
         if isinstance(self.data_cache_dir, str):
             self.data_cache_dir = Path(self.data_cache_dir)
+        if isinstance(self.sector_map_file, str):
+            self.sector_map_file = Path(self.sector_map_file)
         
         # Convert string dates to date objects
         if isinstance(self.start_date, str):
@@ -127,9 +171,24 @@ class StrategyConfig:
         assert self.buffer >= 0, "buffer must be non-negative"
         assert 0 < self.max_weight <= 1, "max_weight must be in (0, 1]"
         assert 0 < self.max_gross_exposure <= 1, "max_gross_exposure must be in (0, 1]"
+        assert 0 < self.sector_cap <= 1, "sector_cap must be in (0, 1]"
+        assert self.beta_cap > 0, "beta_cap must be positive"
+        assert self.beta_lookback_days >= 20, "beta_lookback_days should be at least 20"
+        assert self.drawdown_scaler_full < 0, "drawdown_scaler_full must be negative"
+        assert self.drawdown_scaler_start < 0, "drawdown_scaler_start must be negative"
+        assert self.drawdown_scaler_full < self.drawdown_scaler_start, \
+            "drawdown_scaler_full must be lower than drawdown_scaler_start"
+        assert 0 < self.drawdown_scaler_min <= 1, "drawdown_scaler_min must be in (0, 1]"
         assert self.slippage_bps >= 0, "slippage_bps must be non-negative"
         assert self.start_date < self.end_date, "start_date must be before end_date"
         assert self.execution_delay >= 1, "execution_delay must be at least 1 (t+1)"
+        assert self.rebalance_frequency in {"daily", "weekly"}, \
+            "rebalance_frequency must be 'daily' or 'weekly'"
+        assert 0 <= self.rebalance_weekday <= 4, "rebalance_weekday must be in [0, 4]"
+        assert self.bad_fills_vol_threshold >= 0, "bad_fills_vol_threshold must be non-negative"
+        assert self.bad_fills_multiplier >= 1, "bad_fills_multiplier must be >= 1"
+        assert self.cash_sweep_asset in {"benchmark", "tbill"}, \
+            "cash_sweep_asset must be 'benchmark' or 'tbill'"
     
     def get_logger(self, name: str) -> logging.Logger:
         """Create a logger with the configured level."""
@@ -169,10 +228,31 @@ class StrategyConfig:
             "weight_scheme": self.weight_scheme,
             "max_weight": self.max_weight,
             "max_gross_exposure": self.max_gross_exposure,
+            "sector_cap_enabled": self.sector_cap_enabled,
+            "sector_cap": self.sector_cap,
+            "sector_map_file": str(self.sector_map_file) if self.sector_map_file else None,
+            "beta_cap_enabled": self.beta_cap_enabled,
+            "beta_cap": self.beta_cap,
+            "beta_lookback_days": self.beta_lookback_days,
+            "drawdown_scaler_enabled": self.drawdown_scaler_enabled,
+            "drawdown_scaler_start": self.drawdown_scaler_start,
+            "drawdown_scaler_full": self.drawdown_scaler_full,
+            "drawdown_scaler_min": self.drawdown_scaler_min,
             "slippage_bps": self.slippage_bps,
             "use_atr_slippage": self.use_atr_slippage,
             "atr_slippage_mult": self.atr_slippage_mult,
             "execution_delay": self.execution_delay,
+            "rebalance_frequency": self.rebalance_frequency,
+            "rebalance_weekday": self.rebalance_weekday,
+            "bad_fills_enabled": self.bad_fills_enabled,
+            "bad_fills_vol_threshold": self.bad_fills_vol_threshold,
+            "bad_fills_multiplier": self.bad_fills_multiplier,
+            "randomize_ranks": self.randomize_ranks,
+            "randomize_ranks_seed": self.randomize_ranks_seed,
+            "cash_sweep_to_benchmark": self.cash_sweep_to_benchmark,
+            "cash_sweep_asset": self.cash_sweep_asset,
+            "cash_sweep_tbill_ticker": self.cash_sweep_tbill_ticker,
+            "cash_sweep_risk_off_to_cash": self.cash_sweep_risk_off_to_cash,
             "initial_capital": self.initial_capital,
             "random_seed": self.random_seed,
             "log_level": self.log_level,

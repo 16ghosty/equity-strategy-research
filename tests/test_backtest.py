@@ -156,6 +156,12 @@ class TestBacktestResults:
         assert len(turnover) == 3
         assert turnover.iloc[1] == 0.3
 
+    def test_get_weights_history_default(self, sample_results):
+        """Weights history should default to empty DataFrame."""
+        weights = sample_results.get_weights_history()
+        assert isinstance(weights, pd.DataFrame)
+        assert weights.empty
+
 
 class TestBacktester:
     """Tests for the Backtester class."""
@@ -170,6 +176,98 @@ class TestBacktester:
         assert backtester.rank_computer is not None
         assert backtester.portfolio_constructor is not None
         assert backtester.execution_model is not None
+
+    def test_should_rebalance_daily(self, config):
+        """Daily rebalance should always signal."""
+        config.rebalance_frequency = "daily"
+        backtester = Backtester(config)
+        assert backtester._should_rebalance(pd.Timestamp("2024-01-15"))
+        assert backtester._should_rebalance(pd.Timestamp("2024-01-16"))
+
+    def test_should_rebalance_weekly(self, config):
+        """Weekly rebalance should only signal on configured weekday."""
+        config.rebalance_frequency = "weekly"
+        config.rebalance_weekday = 0  # Monday
+        backtester = Backtester(config)
+        assert backtester._should_rebalance(pd.Timestamp("2024-01-15"))  # Monday
+        assert not backtester._should_rebalance(pd.Timestamp("2024-01-16"))  # Tuesday
+
+    def test_cash_sweep_applies_benchmark_return(self, config):
+        """Positive cash should earn benchmark return when cash sweep is enabled."""
+        config.cash_sweep_to_benchmark = True
+        backtester = Backtester(config)
+        benchmark_returns = pd.Series(
+            [0.01],
+            index=[pd.Timestamp("2024-01-16")],
+            dtype=float,
+        )
+
+        swept_cash = backtester._apply_cash_sweep(
+            cash=1_000_000.0,
+            date=pd.Timestamp("2024-01-16"),
+            sweep_returns=benchmark_returns,
+            risk_off_regime=False,
+        )
+
+        assert swept_cash == pytest.approx(1_010_000.0)
+
+    def test_cash_sweep_disabled_leaves_cash_unchanged(self, config):
+        """Cash sweep off should keep cash unchanged."""
+        config.cash_sweep_to_benchmark = False
+        backtester = Backtester(config)
+        benchmark_returns = pd.Series(
+            [0.02],
+            index=[pd.Timestamp("2024-01-16")],
+            dtype=float,
+        )
+
+        swept_cash = backtester._apply_cash_sweep(
+            cash=500_000.0,
+            date=pd.Timestamp("2024-01-16"),
+            sweep_returns=benchmark_returns,
+            risk_off_regime=False,
+        )
+
+        assert swept_cash == pytest.approx(500_000.0)
+
+    def test_cash_sweep_only_applies_to_positive_cash(self, config):
+        """Negative cash should not be swept through benchmark return."""
+        config.cash_sweep_to_benchmark = True
+        backtester = Backtester(config)
+        benchmark_returns = pd.Series(
+            [0.03],
+            index=[pd.Timestamp("2024-01-16")],
+            dtype=float,
+        )
+
+        swept_cash = backtester._apply_cash_sweep(
+            cash=-10_000.0,
+            date=pd.Timestamp("2024-01-16"),
+            sweep_returns=benchmark_returns,
+            risk_off_regime=False,
+        )
+
+        assert swept_cash == pytest.approx(-10_000.0)
+
+    def test_cash_sweep_risk_off_holds_cash(self, config):
+        """Risk-off regime should keep cash flat when configured."""
+        config.cash_sweep_to_benchmark = True
+        config.cash_sweep_risk_off_to_cash = True
+        backtester = Backtester(config)
+        benchmark_returns = pd.Series(
+            [0.05],
+            index=[pd.Timestamp("2024-01-16")],
+            dtype=float,
+        )
+
+        swept_cash = backtester._apply_cash_sweep(
+            cash=100_000.0,
+            date=pd.Timestamp("2024-01-16"),
+            sweep_returns=benchmark_returns,
+            risk_off_regime=True,
+        )
+
+        assert swept_cash == pytest.approx(100_000.0)
 
 
 # Note: Integration test with real data would require DataManager setup

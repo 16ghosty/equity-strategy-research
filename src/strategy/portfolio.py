@@ -61,6 +61,14 @@ class PortfolioConstructor:
         self.weight_scheme = config.weight_scheme
         self.max_weight = config.max_weight
         self.max_gross_exposure = config.max_gross_exposure
+        self.sector_cap_enabled = config.sector_cap_enabled
+        self.sector_cap = config.sector_cap
+        self.beta_cap_enabled = config.beta_cap_enabled
+        self.beta_cap = config.beta_cap
+        self.drawdown_scaler_enabled = config.drawdown_scaler_enabled
+        self.drawdown_scaler_start = config.drawdown_scaler_start
+        self.drawdown_scaler_full = config.drawdown_scaler_full
+        self.drawdown_scaler_min = config.drawdown_scaler_min
         self.logger = config.get_logger("portfolio")
     
     def construct_portfolio(
@@ -70,7 +78,10 @@ class PortfolioConstructor:
         gate_results: dict[str, GateResults],
         current_holdings: set[str],
         volatilities: Optional[pd.Series] = None,
-        regime_scale: float = 1.0
+        regime_scale: float = 1.0,
+        betas: Optional[pd.Series] = None,
+        sector_map: Optional[dict[str, str]] = None,
+        current_drawdown: Optional[float] = None,
     ) -> PortfolioTarget:
         """
         Construct target portfolio for a given day.
@@ -82,6 +93,9 @@ class PortfolioConstructor:
             current_holdings: Set of currently held tickers
             volatilities: Optional volatilities for inverse-vol weighting
             regime_scale: Global scale from market regime gate
+            betas: Optional rolling beta estimate per ticker
+            sector_map: Optional ticker-to-sector map
+            current_drawdown: Optional current strategy drawdown (negative)
             
         Returns:
             PortfolioTarget with weights
@@ -112,7 +126,13 @@ class PortfolioConstructor:
             )
         
         # Step 3: Apply constraints
-        constrained_weights = self._apply_constraints(raw_weights, regime_scale)
+        drawdown_scale = self.compute_drawdown_scale(current_drawdown)
+        constrained_weights = self._apply_constraints(
+            raw_weights,
+            regime_scale * drawdown_scale,
+            betas=betas,
+            sector_map=sector_map,
+        )
         
         # Step 4: Build result
         gross_exposure = sum(abs(w) for w in constrained_weights.values())
@@ -261,14 +281,18 @@ class PortfolioConstructor:
     def _apply_constraints(
         self,
         raw_weights: dict[str, float],
-        regime_scale: float
+        regime_scale: float,
+        betas: Optional[pd.Series] = None,
+        sector_map: Optional[dict[str, str]] = None,
     ) -> dict[str, float]:
         """
         Apply portfolio constraints.
         
         1. Apply regime scale
         2. Cap single-name weights
-        3. Renormalize to respect gross exposure
+        3. Apply sector cap (optional)
+        4. Apply beta cap (optional)
+        5. Renormalize to respect gross exposure
         
         Args:
             raw_weights: Raw weights before constraints
@@ -284,11 +308,12 @@ class PortfolioConstructor:
         weights = {t: w * regime_scale for t, w in raw_weights.items()}
         
         # Cap individual weights
-        capped = False
         for ticker in weights:
             if weights[ticker] > self.max_weight:
                 weights[ticker] = self.max_weight
-                capped = True
+
+        weights = self._apply_sector_cap(weights, sector_map=sector_map)
+        weights = self._apply_beta_cap(weights, betas=betas)
         
         # Renormalize if needed to respect max gross exposure
         gross = sum(abs(w) for w in weights.values())
@@ -300,6 +325,84 @@ class PortfolioConstructor:
         weights = {t: w for t, w in weights.items() if w > 1e-6}
         
         return weights
+
+    def _apply_sector_cap(
+        self,
+        weights: dict[str, float],
+        sector_map: Optional[dict[str, str]] = None,
+    ) -> dict[str, float]:
+        """
+        Cap aggregate exposure by sector.
+
+        Unknown sectors are grouped into "UNKNOWN".
+        """
+        if not self.sector_cap_enabled or not weights:
+            return weights
+
+        sector_map = sector_map or {}
+        sector_totals: dict[str, float] = {}
+        for ticker, weight in weights.items():
+            sector = sector_map.get(ticker, "UNKNOWN")
+            sector_totals[sector] = sector_totals.get(sector, 0.0) + weight
+
+        adjusted = weights.copy()
+        for sector, total in sector_totals.items():
+            if total <= self.sector_cap or total <= 0:
+                continue
+            scale = self.sector_cap / total
+            for ticker, weight in list(adjusted.items()):
+                if sector_map.get(ticker, "UNKNOWN") == sector:
+                    adjusted[ticker] = weight * scale
+
+        return adjusted
+
+    def _apply_beta_cap(
+        self,
+        weights: dict[str, float],
+        betas: Optional[pd.Series] = None,
+    ) -> dict[str, float]:
+        """
+        Cap weighted portfolio beta by scaling gross exposure down when needed.
+        """
+        if not self.beta_cap_enabled or not weights:
+            return weights
+
+        betas = betas if betas is not None else pd.Series(dtype=float)
+        portfolio_beta = 0.0
+        for ticker, weight in weights.items():
+            beta = betas.get(ticker, 1.0)
+            if pd.isna(beta):
+                beta = 1.0
+            portfolio_beta += weight * float(beta)
+
+        if portfolio_beta <= self.beta_cap or portfolio_beta <= 1e-12:
+            return weights
+
+        scale = self.beta_cap / portfolio_beta
+        return {ticker: weight * scale for ticker, weight in weights.items()}
+
+    def compute_drawdown_scale(self, current_drawdown: Optional[float]) -> float:
+        """
+        Convert current drawdown into an exposure scale.
+
+        Scale remains 1 above drawdown_scaler_start and decays linearly down to
+        drawdown_scaler_min at drawdown_scaler_full.
+        """
+        if not self.drawdown_scaler_enabled:
+            return 1.0
+        if current_drawdown is None or pd.isna(current_drawdown):
+            return 1.0
+
+        dd = float(current_drawdown)
+        if dd >= self.drawdown_scaler_start:
+            return 1.0
+        if dd <= self.drawdown_scaler_full:
+            return self.drawdown_scaler_min
+
+        span = self.drawdown_scaler_start - self.drawdown_scaler_full
+        progress = (self.drawdown_scaler_start - dd) / span
+        scale = 1.0 - progress * (1.0 - self.drawdown_scaler_min)
+        return float(np.clip(scale, self.drawdown_scaler_min, 1.0))
     
     def compute_turnover(
         self,

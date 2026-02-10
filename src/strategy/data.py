@@ -9,6 +9,7 @@ from abc import ABC, abstractmethod
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Optional
+import json
 import logging
 
 import pandas as pd
@@ -340,6 +341,8 @@ class DataManager:
         self._ohlcv: Optional[pd.DataFrame] = None
         self._benchmark: Optional[pd.DataFrame] = None
         self._tickers: Optional[list[str]] = None
+        self._sector_map: Optional[dict[str, str]] = None
+        self._extra_assets: dict[str, pd.DataFrame] = {}
     
     def load_data(self) -> None:
         """Load all required data (tickers + benchmark)."""
@@ -445,3 +448,74 @@ class DataManager:
         if 'Adj Close' in self.benchmark.columns:
             return self.benchmark['Adj Close']
         return self.benchmark['Close']
+
+    def get_asset_close(self, ticker: str) -> pd.Series:
+        """
+        Get adjusted close prices for an auxiliary asset ticker.
+
+        This is used for cash sweep proxies (e.g., T-bill ETF).
+        """
+        t = str(ticker).upper()
+        if t == self.config.benchmark.upper():
+            return self.get_benchmark_close()
+
+        if t not in self._extra_assets:
+            self._extra_assets[t] = self.provider.get_benchmark(
+                t,
+                self.config.start_date,
+                self.config.end_date,
+            )
+
+        asset_df = self._extra_assets[t]
+        if 'Adj Close' in asset_df.columns:
+            return asset_df['Adj Close']
+        return asset_df['Close']
+
+    def get_sector_map(self) -> dict[str, str]:
+        """
+        Load optional ticker->sector mapping.
+
+        Supports JSON dict files and CSV files with columns:
+        - ticker, sector
+        """
+        if self._sector_map is not None:
+            return self._sector_map
+
+        path = self.config.sector_map_file
+        if path is None:
+            self._sector_map = {}
+            return self._sector_map
+
+        path = Path(path)
+        if not path.exists():
+            self.logger.warning(f"Sector map file not found: {path}")
+            self._sector_map = {}
+            return self._sector_map
+
+        try:
+            if path.suffix.lower() == ".json":
+                with open(path) as f:
+                    raw = json.load(f)
+                if isinstance(raw, dict):
+                    self._sector_map = {str(k).upper(): str(v) for k, v in raw.items()}
+                else:
+                    self.logger.warning("Sector map JSON must be a dict of ticker->sector.")
+                    self._sector_map = {}
+            else:
+                df = pd.read_csv(path)
+                cols = {c.lower(): c for c in df.columns}
+                if "ticker" not in cols or "sector" not in cols:
+                    self.logger.warning(
+                        "Sector map CSV must contain 'ticker' and 'sector' columns."
+                    )
+                    self._sector_map = {}
+                else:
+                    self._sector_map = {
+                        str(row[cols["ticker"]]).upper(): str(row[cols["sector"]])
+                        for _, row in df.iterrows()
+                    }
+        except Exception as e:
+            self.logger.warning(f"Failed to load sector map: {e}")
+            self._sector_map = {}
+
+        return self._sector_map

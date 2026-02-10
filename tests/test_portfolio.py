@@ -256,6 +256,68 @@ class TestPortfolioConstructor:
         # AAPL should have higher weight than MSFT (lower vol)
         assert portfolio.weights['AAPL'] > portfolio.weights['MSFT']
 
+    def test_sector_cap_constraint(self, config, sample_ranks, sample_gate_results):
+        """Sector cap should limit aggregate exposure for crowded sectors."""
+        config.top_k = 4
+        config.max_weight = 1.0
+        config.sector_cap_enabled = True
+        config.sector_cap = 0.40
+        constructor = PortfolioConstructor(config)
+
+        portfolio = constructor.construct_portfolio(
+            date=pd.Timestamp("2024-01-15"),
+            ranks=sample_ranks,
+            gate_results=sample_gate_results,
+            current_holdings=set(),
+            sector_map={
+                "AAPL": "TECH",
+                "MSFT": "TECH",
+                "GOOGL": "TECH",
+                "AMZN": "CONSUMER",
+            },
+        )
+
+        tech_weight = sum(
+            w for t, w in portfolio.weights.items()
+            if t in {"AAPL", "MSFT", "GOOGL"}
+        )
+        assert tech_weight <= config.sector_cap + 1e-9
+
+    def test_beta_cap_scales_exposure(self, config, sample_ranks, sample_gate_results):
+        """Beta cap should de-risk high beta portfolios."""
+        config.top_k = 3
+        config.max_weight = 1.0
+        config.beta_cap_enabled = True
+        config.beta_cap = 0.70
+        constructor = PortfolioConstructor(config)
+
+        portfolio = constructor.construct_portfolio(
+            date=pd.Timestamp("2024-01-15"),
+            ranks=sample_ranks,
+            gate_results=sample_gate_results,
+            current_holdings=set(),
+            betas=pd.Series({"AAPL": 2.0, "MSFT": 2.0, "GOOGL": 2.0}),
+        )
+
+        realized_beta = sum(portfolio.weights[t] * 2.0 for t in portfolio.weights)
+        assert realized_beta <= config.beta_cap + 1e-6
+
+    def test_drawdown_scaler_reduces_weights(self, config, sample_ranks, sample_gate_results):
+        """Drawdown scaler should gradually reduce exposure in deeper drawdowns."""
+        config.drawdown_scaler_enabled = True
+        config.drawdown_scaler_start = -0.05
+        config.drawdown_scaler_full = -0.20
+        config.drawdown_scaler_min = 0.30
+        constructor = PortfolioConstructor(config)
+
+        full = constructor.compute_drawdown_scale(current_drawdown=-0.02)
+        partial = constructor.compute_drawdown_scale(current_drawdown=-0.10)
+        minimum = constructor.compute_drawdown_scale(current_drawdown=-0.30)
+
+        assert full == pytest.approx(1.0)
+        assert config.drawdown_scaler_min < partial < 1.0
+        assert minimum == pytest.approx(config.drawdown_scaler_min)
+
 
 class TestPortfolioTarget:
     """Tests for PortfolioTarget dataclass."""

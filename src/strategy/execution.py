@@ -63,11 +63,13 @@ class ExecutionResult:
         trades: List of executed trades
         total_cost: Total slippage cost
         gross_traded: Total notional traded
+        net_cash_flow: Signed trade cash flow (sells positive, buys negative)
     """
     date: pd.Timestamp
     trades: list[Trade]
     total_cost: float
     gross_traded: float
+    net_cash_flow: float
     
     @property
     def num_trades(self) -> int:
@@ -106,7 +108,8 @@ class ExecutionModel:
         self,
         price: float,
         side: str,
-        atr: Optional[float] = None
+        atr: Optional[float] = None,
+        multiplier: float = 1.0,
     ) -> float:
         """
         Compute slippage cost for a trade.
@@ -127,13 +130,14 @@ class ExecutionModel:
         else:
             slippage = price * (self.slippage_bps / 10000)
         
-        return slippage
+        return slippage * max(multiplier, 0.0)
     
     def get_execution_price(
         self,
         open_price: float,
         side: str,
-        atr: Optional[float] = None
+        atr: Optional[float] = None,
+        slippage_multiplier: float = 1.0,
     ) -> tuple[float, float]:
         """
         Get execution price including slippage.
@@ -146,7 +150,12 @@ class ExecutionModel:
         Returns:
             Tuple of (execution_price, slippage_cost_per_share)
         """
-        slippage = self.compute_slippage(open_price, side, atr)
+        slippage = self.compute_slippage(
+            open_price,
+            side,
+            atr,
+            multiplier=slippage_multiplier,
+        )
         
         if side == 'BUY':
             execution_price = open_price + slippage
@@ -164,6 +173,7 @@ class ExecutionModel:
         portfolio_value: float,
         open_prices: pd.Series,
         atrs: Optional[pd.Series] = None,
+        slippage_multiplier: float = 1.0,
     ) -> tuple[dict[str, float], ExecutionResult]:
         """
         Execute a portfolio rebalance.
@@ -213,7 +223,7 @@ class ExecutionModel:
             # Get execution price with slippage
             atr = atrs.get(ticker) if atrs is not None else None
             exec_price, slippage_per_share = self.get_execution_price(
-                open_price, side, atr
+                open_price, side, atr, slippage_multiplier=slippage_multiplier
             )
             
             # Calculate trade value and slippage cost
@@ -243,12 +253,17 @@ class ExecutionModel:
         # Create execution result
         total_cost = sum(t.slippage_cost for t in trades)
         gross_traded = sum(t.notional for t in trades)
+        net_cash_flow = sum(
+            t.notional if t.side == "SELL" else -t.notional
+            for t in trades
+        )
         
         result = ExecutionResult(
             date=execution_date,
             trades=trades,
             total_cost=total_cost,
             gross_traded=gross_traded,
+            net_cash_flow=net_cash_flow,
         )
         
         return new_positions, result
@@ -263,10 +278,63 @@ class ExecutionModel:
         if not self.trades_ledger:
             return pd.DataFrame(columns=[
                 'date', 'ticker', 'side', 'shares', 'price', 
-                'notional', 'slippage_cost', 'signal_date'
+                'notional', 'slippage_cost', 'signal_date',
+                'realized_pnl', 'trade_pnl_after_slippage',
+                'cumulative_realized_pnl', 'cumulative_trade_pnl',
             ])
-        
-        return pd.DataFrame([t.to_dict() for t in self.trades_ledger])
+
+        df = pd.DataFrame([t.to_dict() for t in self.trades_ledger])
+        return self._attach_trade_pnl(df)
+
+    def _attach_trade_pnl(self, trades: pd.DataFrame) -> pd.DataFrame:
+        """
+        Attach FIFO realized PnL columns at per-trade granularity.
+
+        Realized PnL is recognized on SELL rows when lots are closed.
+        BUY rows have realized_pnl=0 by design.
+        """
+        if trades.empty:
+            return trades
+
+        df = trades.copy()
+        df["date"] = pd.to_datetime(df["date"])
+        df = df.sort_values(["ticker", "date"]).reset_index(drop=True)
+        df["realized_pnl"] = 0.0
+
+        for ticker, idx in df.groupby("ticker", sort=False).groups.items():
+            inventory: list[list[float]] = []  # [buy_price, shares]
+
+            for row_idx in idx:
+                row = df.loc[row_idx]
+                side = str(row["side"])
+                qty = float(row["shares"])
+                px = float(row["price"])
+
+                if side == "BUY":
+                    inventory.append([px, qty])
+                    continue
+
+                qty_to_sell = qty
+                realized = 0.0
+                while qty_to_sell > 1e-8 and inventory:
+                    buy_px, buy_qty = inventory[0]
+                    matched = min(qty_to_sell, buy_qty)
+                    realized += matched * (px - buy_px)
+                    qty_to_sell -= matched
+                    buy_qty -= matched
+
+                    if buy_qty <= 1e-8:
+                        inventory.pop(0)
+                    else:
+                        inventory[0][1] = buy_qty
+
+                df.at[row_idx, "realized_pnl"] = realized
+
+        df["trade_pnl_after_slippage"] = df["realized_pnl"] - df["slippage_cost"].astype(float)
+        df["cumulative_realized_pnl"] = df["realized_pnl"].cumsum()
+        df["cumulative_trade_pnl"] = df["trade_pnl_after_slippage"].cumsum()
+
+        return df
     
     def reset_ledger(self) -> None:
         """Clear the trades ledger."""

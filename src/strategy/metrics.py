@@ -52,6 +52,16 @@ class PerformanceMetrics:
     cost_ratio: float
     total_return: float
     num_trading_days: int
+    var_95: float = 0.0
+    var_99: float = 0.0
+    es_95: float = 0.0
+    es_99: float = 0.0
+    cdar_95: float = 0.0
+    skewness: float = 0.0
+    kurtosis: float = 0.0
+    worst_1d_return: float = 0.0
+    worst_5d_return: float = 0.0
+    tail_ratio: float = 0.0
     
     def to_dict(self) -> dict:
         """Convert to dictionary."""
@@ -70,6 +80,16 @@ class PerformanceMetrics:
             'Cost Ratio': f"{self.cost_ratio:.2%}",
             'Total Return': f"{self.total_return:.2%}",
             'Trading Days': f"{self.num_trading_days:,}",
+            'VaR (95%)': f"{self.var_95:.2%}",
+            'VaR (99%)': f"{self.var_99:.2%}",
+            'ES (95%)': f"{self.es_95:.2%}",
+            'ES (99%)': f"{self.es_99:.2%}",
+            'CDaR (95%)': f"{self.cdar_95:.2%}",
+            'Skewness': f"{self.skewness:.3f}",
+            'Kurtosis': f"{self.kurtosis:.3f}",
+            'Worst 1-Day Return': f"{self.worst_1d_return:.2%}",
+            'Worst 5-Day Return': f"{self.worst_5d_return:.2%}",
+            'Tail Ratio (95/5)': f"{self.tail_ratio:.3f}",
         }
     
     def __repr__(self) -> str:
@@ -329,6 +349,102 @@ def compute_cost_ratio(
     return total_costs / gross_pnl
 
 
+def compute_var(returns: pd.Series, confidence: float = 0.95) -> float:
+    """
+    Compute historical Value at Risk at a confidence level.
+
+    Args:
+        returns: Return series
+        confidence: Confidence level (e.g., 0.95, 0.99)
+
+    Returns:
+        Historical VaR return threshold (typically negative)
+    """
+    clean = returns.dropna()
+    if clean.empty:
+        return 0.0
+    return float(clean.quantile(1.0 - confidence))
+
+
+def compute_expected_shortfall(returns: pd.Series, confidence: float = 0.95) -> float:
+    """
+    Compute historical Expected Shortfall (CVaR) at a confidence level.
+
+    Args:
+        returns: Return series
+        confidence: Confidence level (e.g., 0.95, 0.99)
+
+    Returns:
+        Mean return of losses beyond VaR threshold
+    """
+    clean = returns.dropna()
+    if clean.empty:
+        return 0.0
+    var_threshold = compute_var(clean, confidence=confidence)
+    tail = clean[clean <= var_threshold]
+    if tail.empty:
+        return var_threshold
+    return float(tail.mean())
+
+
+def compute_cdar(drawdowns: pd.Series, confidence: float = 0.95) -> float:
+    """
+    Compute Conditional Drawdown-at-Risk from drawdown series.
+
+    Args:
+        drawdowns: Drawdown series (negative values)
+        confidence: Confidence level (e.g., 0.95)
+
+    Returns:
+        Mean of worst drawdowns beyond the tail threshold
+    """
+    clean = drawdowns.dropna()
+    if clean.empty:
+        return 0.0
+    threshold = float(clean.quantile(1.0 - confidence))
+    tail = clean[clean <= threshold]
+    if tail.empty:
+        return threshold
+    return float(tail.mean())
+
+
+def compute_worst_period_return(returns: pd.Series, window: int = 5) -> float:
+    """
+    Compute worst compounded return over a rolling window.
+
+    Args:
+        returns: Daily return series
+        window: Rolling window length in days
+
+    Returns:
+        Worst compounded window return
+    """
+    clean = returns.dropna()
+    if clean.empty:
+        return 0.0
+    if window <= 1:
+        return float(clean.min())
+    rolling = (1.0 + clean).rolling(window=window).apply(np.prod, raw=True) - 1.0
+    rolling = rolling.dropna()
+    if rolling.empty:
+        return float(clean.min())
+    return float(rolling.min())
+
+
+def compute_tail_ratio(returns: pd.Series) -> float:
+    """
+    Compute upside/downside tail ratio using 95th vs 5th percentile returns.
+    """
+    clean = returns.dropna()
+    if clean.empty:
+        return 0.0
+    p95 = float(clean.quantile(0.95))
+    p05 = float(clean.quantile(0.05))
+    if abs(p05) < 1e-12:
+        return float('inf') if p95 > 0 else 0.0
+    return abs(p95) / abs(p05)
+
+
 def compute_metrics(results: BacktestResults) -> PerformanceMetrics:
     """
     Compute all performance metrics from backtest results.
@@ -350,6 +466,17 @@ def compute_metrics(results: BacktestResults) -> PerformanceMetrics:
     sortino = compute_sortino(returns)
     max_dd = compute_max_drawdown(equity_curve)
     vol = compute_volatility(returns)
+    drawdowns = compute_drawdown_series(equity_curve)
+    var_95 = compute_var(returns, confidence=0.95)
+    var_99 = compute_var(returns, confidence=0.99)
+    es_95 = compute_expected_shortfall(returns, confidence=0.95)
+    es_99 = compute_expected_shortfall(returns, confidence=0.99)
+    cdar_95 = compute_cdar(drawdowns, confidence=0.95)
+    skewness = float(returns.dropna().skew()) if len(returns.dropna()) > 2 else 0.0
+    kurtosis = float(returns.dropna().kurt()) if len(returns.dropna()) > 3 else 0.0
+    worst_1d = float(returns.min()) if len(returns.dropna()) > 0 else 0.0
+    worst_5d = compute_worst_period_return(returns, window=5)
+    tail_ratio = compute_tail_ratio(returns)
     
     # Turnover
     daily_turnover, annual_turnover = compute_turnover_stats(turnover)
@@ -386,6 +513,16 @@ def compute_metrics(results: BacktestResults) -> PerformanceMetrics:
         cost_ratio=cost_ratio if cost_ratio != float('inf') else 0.0,
         total_return=total_return,
         num_trading_days=len(equity_curve),
+        var_95=var_95,
+        var_99=var_99,
+        es_95=es_95,
+        es_99=es_99,
+        cdar_95=cdar_95,
+        skewness=skewness,
+        kurtosis=kurtosis,
+        worst_1d_return=worst_1d,
+        worst_5d_return=worst_5d,
+        tail_ratio=tail_ratio if tail_ratio != float('inf') else 0.0,
     )
 
 
@@ -547,4 +684,3 @@ def compute_trade_stats(trades: pd.DataFrame) -> pd.DataFrame:
     data = [s.to_dict() for s in stats_list]
     
     return pd.DataFrame(data)
-

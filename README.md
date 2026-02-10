@@ -54,6 +54,8 @@ equity_strategy/
 │       ├── backtest.py     # Main backtest engine
 │       ├── metrics.py      # Performance metrics
 │       ├── reporting.py    # Charts and HTML reports
+│       ├── analysis.py     # Stress + sensitivity runner
+│       ├── validation.py   # Training/validation tail-risk suite
 │       └── main.py         # CLI runner
 ├── tests/                  # Unit tests
 └── reports/
@@ -156,6 +158,34 @@ All parameters are centralized in `StrategyConfig`:
 | `slippage_bps` | 10 | Slippage in basis points |
 | `execution_delay` | 1 | Days delay for execution (T+1) |
 
+## Baseline Configuration
+
+Going forward, the baseline strategy configuration is:
+
+| Parameter | Baseline Value |
+|-----------|----------------|
+| `top_k` | 10 |
+| `buffer` | 10 |
+| `momentum_lookback` | 120 |
+| `momentum_skip` | 5 |
+| `liquidity_threshold` | 1,000,000 |
+| `min_price` | 5.0 |
+| `vol_cap` | 0.60 |
+| `weight_scheme` | `"equal"` |
+| `max_weight` | 0.10 |
+
+Reference baseline config file:
+- `configs/baseline_strategy.json`
+
+Run command:
+
+```bash
+python -m strategy.main \
+  --config configs/baseline_strategy.json \
+  --output reports/output/baseline_run \
+  --wandb --wandb-mode online --wandb-log-artifacts
+```
+
 ## Strategy Logic
 
 ### 1. Universe Selection (Monthly)
@@ -193,6 +223,9 @@ The `metrics.py` module computes:
 - **Annual Volatility**: Annualized return standard deviation
 - **Turnover**: Daily and annualized portfolio turnover
 - **Cost Ratio**: Trading costs as % of gross PnL
+- **VaR / ES**: VaR(95/99) and Expected Shortfall(95/99)
+- **CDaR(95%)**: Conditional drawdown-at-risk
+- **Tail shape**: Skew, kurtosis, worst 1-day/5-day, tail ratio
 
 ## Reports
 
@@ -203,6 +236,45 @@ Generated HTML reports include:
 - Rolling Sharpe ratio
 - Positions and exposure over time
 - Daily turnover analysis
+- Daily return distribution
+- Negative-tail distribution (<= 5th percentile)
+
+## Weights & Biases (Optional)
+
+W&B integration is available for both:
+- `strategy.main` (primary backtest runs)
+- `strategy.analysis` (stress tests and parameter sensitivity runs)
+
+Setup:
+
+```bash
+# Optional dependency
+pip install -e ".[tracking]"
+
+# Set key in environment (do not hardcode in code or config files)
+export WANDB_API_KEY="your_api_key_here"
+```
+
+Example usage:
+
+```bash
+# Main backtest tracking
+python -m strategy.main --wandb --wandb-log-artifacts
+
+# Stress + sensitivity tracking
+python -m strategy.analysis --mode all --wandb --wandb-log-artifacts
+
+# Training vs validation suite (labeled outputs)
+python -m strategy.validation \
+  --training-start 2008-01-01 --training-end 2023-12-31 \
+  --validation-start 2024-01-01 --validation-end 2026-02-09 \
+  --wandb --wandb-log-artifacts
+```
+
+Notes:
+- Keep API keys in environment variables only.
+- Default mode is online. Use `--wandb-mode offline` for deferred syncing.
+- Offline runs can be synced later with `wandb sync`.
 
 ## Testing
 

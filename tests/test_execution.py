@@ -93,6 +93,8 @@ class TestExecutionModel:
         # Should have AAPL position
         assert 'AAPL' in new_positions
         assert new_positions['AAPL'] > 0
+        assert result.net_cash_flow < 0
+        assert result.net_cash_flow == pytest.approx(-result.gross_traded)
     
     def test_execute_rebalance_sell(self, config):
         """Test executing a sell order."""
@@ -114,6 +116,30 @@ class TestExecutionModel:
         assert result.num_trades == 1
         assert result.trades[0].side == 'SELL'
         assert 'AAPL' not in new_positions
+        assert result.net_cash_flow > 0
+        assert result.net_cash_flow == pytest.approx(result.gross_traded)
+
+    def test_execute_rebalance_mixed_net_cash_flow(self, config):
+        """Net cash flow should equal signed sum of trade notionals."""
+        model = ExecutionModel(config)
+
+        signal_date = pd.Timestamp("2024-01-15")
+        exec_date = pd.Timestamp("2024-01-16")
+
+        _, result = model.execute_rebalance(
+            signal_date=signal_date,
+            execution_date=exec_date,
+            current_positions={"AAPL": 1000.0, "MSFT": 1000.0},
+            target_weights={"AAPL": 0.5},  # keep AAPL, liquidate MSFT
+            portfolio_value=300_000,
+            open_prices=pd.Series({"AAPL": 150.0, "MSFT": 100.0}),
+        )
+
+        expected = sum(
+            t.notional if t.side == "SELL" else -t.notional
+            for t in result.trades
+        )
+        assert result.net_cash_flow == pytest.approx(expected)
     
     def test_trades_ledger(self, config):
         """Test that trades are recorded in ledger."""
@@ -134,6 +160,9 @@ class TestExecutionModel:
         assert len(ledger) == 3
         assert 'ticker' in ledger.columns
         assert 'side' in ledger.columns
+        assert 'realized_pnl' in ledger.columns
+        assert 'trade_pnl_after_slippage' in ledger.columns
+        assert (ledger['realized_pnl'] == 0).all()  # buy-only sequence
     
     def test_atr_slippage(self, config):
         """Test ATR-based slippage."""
@@ -144,6 +173,49 @@ class TestExecutionModel:
         # ATR of $2 with 10% mult = $0.20 slippage
         slippage = model.compute_slippage(price=100.0, side='BUY', atr=2.0)
         assert abs(slippage - 0.20) < 0.001
+
+    def test_slippage_multiplier(self, config):
+        """Test slippage multiplier for bad-fill scenarios."""
+        model = ExecutionModel(config)
+        base = model.compute_slippage(price=100.0, side='BUY')
+        stressed = model.compute_slippage(price=100.0, side='BUY', multiplier=2.5)
+        assert stressed == pytest.approx(base * 2.5)
+
+    def test_realized_pnl_on_sell_trade(self, config):
+        """SELL rows should include FIFO realized PnL."""
+        config.slippage_bps = 0.0
+        model = ExecutionModel(config)
+
+        signal_buy = pd.Timestamp("2024-01-10")
+        exec_buy = pd.Timestamp("2024-01-11")
+        positions, _ = model.execute_rebalance(
+            signal_date=signal_buy,
+            execution_date=exec_buy,
+            current_positions={},
+            target_weights={"AAPL": 1.0},
+            portfolio_value=100_000,
+            open_prices=pd.Series({"AAPL": 100.0}),
+        )
+
+        signal_sell = pd.Timestamp("2024-01-11")
+        exec_sell = pd.Timestamp("2024-01-12")
+        _, _ = model.execute_rebalance(
+            signal_date=signal_sell,
+            execution_date=exec_sell,
+            current_positions=positions,
+            target_weights={},
+            portfolio_value=110_000,
+            open_prices=pd.Series({"AAPL": 110.0}),
+        )
+
+        ledger = model.get_trades_ledger().sort_values("date")
+        assert len(ledger) == 2
+        buy_row = ledger.iloc[0]
+        sell_row = ledger.iloc[1]
+        assert buy_row["side"] == "BUY"
+        assert sell_row["side"] == "SELL"
+        assert buy_row["realized_pnl"] == pytest.approx(0.0)
+        assert sell_row["realized_pnl"] > 0
 
 
 class TestTrade:
