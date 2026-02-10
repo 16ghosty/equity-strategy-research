@@ -146,9 +146,9 @@ All parameters are centralized in `StrategyConfig`:
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `universe_size` | 100 | Number of stocks in tradeable universe |
-| `top_k` | 20 | Number of positions to hold |
-| `buffer` | 5 | Exit buffer (exit if rank > top_k + buffer) |
-| `momentum_lookback` | 60 | Days for momentum calculation |
+| `top_k` | 10 | Number of positions to hold |
+| `buffer` | 25 | Exit buffer (exit if rank > top_k + buffer) |
+| `momentum_lookback` | 120 | Days for momentum calculation |
 | `momentum_skip` | 5 | Recent days to skip (avoid reversal) |
 | `liquidity_threshold` | 1,000,000 | Min average dollar volume |
 | `min_price` | 5.0 | Min stock price |
@@ -165,7 +165,7 @@ Going forward, the baseline strategy configuration is:
 | Parameter | Baseline Value |
 |-----------|----------------|
 | `top_k` | 10 |
-| `buffer` | 10 |
+| `buffer` | 25 |
 | `momentum_lookback` | 120 |
 | `momentum_skip` | 5 |
 | `liquidity_threshold` | 1,000,000 |
@@ -173,6 +173,11 @@ Going forward, the baseline strategy configuration is:
 | `vol_cap` | 0.60 |
 | `weight_scheme` | `"equal"` |
 | `max_weight` | 0.10 |
+
+Method toggles remain available but are off by default in the baseline:
+- scheduled/hybrid rebalancing (`rebalance_frequency="daily"`, `entries_on_rebalance_only=false`)
+- no-trade band (`min_trade_weight_change=0.0`)
+- beta-target overlay (`beta_targeting_enabled=false`)
 
 Reference baseline config file:
 - `configs/baseline_strategy.json`

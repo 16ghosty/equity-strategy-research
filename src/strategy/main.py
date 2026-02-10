@@ -21,8 +21,12 @@ from .metrics import compute_metrics, print_metrics_summary
 from .reporting import (
     build_plotly_charts,
     compute_benchmark_diagnostics,
+    compute_cost_drag_by_year,
     compute_drawdown_detractor_metrics,
+    compute_rebalance_event_costs,
     compute_ticker_health_table,
+    compute_turnover_performance_by_year,
+    compute_worst_trades_table,
     generate_full_report,
 )
 from .wandb_utils import (
@@ -89,7 +93,7 @@ def parse_args():
     parser.add_argument(
         '--top-k',
         type=int,
-        default=20,
+        default=10,
         help='Number of positions to hold'
     )
     
@@ -434,6 +438,10 @@ def main():
         lookback_days=63,
         top_n=20,
     )
+    turnover_perf_by_year = compute_turnover_performance_by_year(results)
+    cost_drag_by_year = compute_cost_drag_by_year(results)
+    rebalance_event_costs = compute_rebalance_event_costs(results)
+    worst_trades_top20 = compute_worst_trades_table(results, top_n=20)
 
     ticker_health_path = Path(args.output) / "ticker_health_metrics.csv"
     if not ticker_health.empty:
@@ -449,6 +457,26 @@ def main():
     if not benchmark_diagnostics.empty:
         benchmark_diagnostics.to_csv(benchmark_diag_path, index=False)
         logger.info(f"Benchmark diagnostics saved to: {benchmark_diag_path}")
+
+    turnover_perf_path = Path(args.output) / "turnover_performance_by_year.csv"
+    if not turnover_perf_by_year.empty:
+        turnover_perf_by_year.to_csv(turnover_perf_path, index=False)
+        logger.info(f"Turnover/performance by year saved to: {turnover_perf_path}")
+
+    cost_drag_year_path = Path(args.output) / "cost_drag_by_year.csv"
+    if not cost_drag_by_year.empty:
+        cost_drag_by_year.to_csv(cost_drag_year_path, index=False)
+        logger.info(f"Cost drag by year saved to: {cost_drag_year_path}")
+
+    rebalance_cost_path = Path(args.output) / "rebalance_event_costs.csv"
+    if not rebalance_event_costs.empty:
+        rebalance_event_costs.to_csv(rebalance_cost_path, index=False)
+        logger.info(f"Rebalance event cost table saved to: {rebalance_cost_path}")
+
+    worst_trades_path = Path(args.output) / "worst_trades_top20.csv"
+    if not worst_trades_top20.empty:
+        worst_trades_top20.to_csv(worst_trades_path, index=False)
+        logger.info(f"Worst trades table saved to: {worst_trades_path}")
     
     logger.info("=" * 60)
     logger.info("BACKTEST COMPLETE")
@@ -485,6 +513,14 @@ def main():
             )
         if not benchmark_diagnostics.empty:
             log_dataframe_table(run, "benchmark_diagnostics", benchmark_diagnostics)
+        if not turnover_perf_by_year.empty:
+            log_dataframe_table(run, "turnover_performance_by_year", turnover_perf_by_year)
+        if not cost_drag_by_year.empty:
+            log_dataframe_table(run, "cost_drag_by_year", cost_drag_by_year)
+        if not rebalance_event_costs.empty:
+            log_dataframe_table(run, "rebalance_event_costs", rebalance_event_costs.head(2000))
+        if not worst_trades_top20.empty:
+            log_dataframe_table(run, "worst_trades_top20", worst_trades_top20)
         log_metrics(
             run,
             {
@@ -493,6 +529,10 @@ def main():
                 "ticker_health_metrics_path": str(ticker_health_path) if ticker_health_path.exists() else "",
                 "drawdown_detractor_metrics_path": str(detractor_metrics_path) if detractor_metrics_path.exists() else "",
                 "benchmark_diagnostics_path": str(benchmark_diag_path) if benchmark_diag_path.exists() else "",
+                "turnover_performance_by_year_path": str(turnover_perf_path) if turnover_perf_path.exists() else "",
+                "cost_drag_by_year_path": str(cost_drag_year_path) if cost_drag_year_path.exists() else "",
+                "rebalance_event_costs_path": str(rebalance_cost_path) if rebalance_cost_path.exists() else "",
+                "worst_trades_top20_path": str(worst_trades_path) if worst_trades_path.exists() else "",
             },
             prefix="artifacts",
         )

@@ -63,8 +63,11 @@ class StrategyConfig:
         use_atr_slippage: If True, use ATR-based slippage model
         atr_slippage_mult: Multiplier for ATR slippage (fraction of ATR)
         execution_delay: Days between signal and execution (1 = t+1 open)
-        rebalance_frequency: Rebalance cadence ('daily' or 'weekly')
+        rebalance_frequency: Rebalance cadence ('daily', 'weekly', or 'custom')
         rebalance_weekday: Weekday for weekly rebalance (0=Mon ... 4=Fri)
+        rebalance_weekdays: Weekdays for custom rebalancing (e.g., Mon/Wed/Fri = [0,2,4])
+        evaluate_exits_daily: If True, evaluate exits on non-rebalance days
+        entries_on_rebalance_only: If True, block new entries on non-rebalance days
         bad_fills_enabled: If True, increase slippage on high-volatility days
         bad_fills_vol_threshold: Annualized benchmark vol threshold for bad fills
         bad_fills_multiplier: Slippage multiplier applied on bad-fill days
@@ -75,6 +78,17 @@ class StrategyConfig:
         cash_sweep_tbill_ticker: T-bill proxy ticker used when cash_sweep_asset='tbill'
         cash_sweep_risk_off_to_cash: If True, keep idle cash uninvested during risk-off regime
         
+        min_trade_weight_change: Minimum absolute weight delta required to trade
+            (no-trade band / churn filter)
+        beta_targeting_enabled: If True, scale stock sleeve toward target beta regime
+        beta_target_risk_on: Target portfolio beta in risk-on regime
+        beta_target_neutral: Target portfolio beta in neutral regime
+        beta_target_risk_off: Target portfolio beta in risk-off regime
+        beta_target_hysteresis: Minimum beta error before adjusting sleeve
+        beta_target_step_limit: Max stock-sleeve exposure change per day
+        beta_target_stock_min: Minimum stock sleeve exposure allowed
+        beta_target_stock_max: Maximum stock sleeve exposure allowed
+
         # Backtest settings
         initial_capital: Starting portfolio value
         random_seed: Seed for reproducibility
@@ -104,12 +118,12 @@ class StrategyConfig:
     regime_vol_threshold: float = 0.25  # 25% annualized vol threshold for regime
     
     # Ranking settings
-    momentum_lookback: int = 60
+    momentum_lookback: int = 120
     momentum_skip: int = 5
     
     # Portfolio settings
-    top_k: int = 20
-    buffer: int = 5
+    top_k: int = 10
+    buffer: int = 25
     weight_scheme: Literal["equal", "inverse_vol"] = "equal"
     max_weight: float = 0.10  # 10% max single name
     max_gross_exposure: float = 1.0
@@ -129,8 +143,11 @@ class StrategyConfig:
     use_atr_slippage: bool = False
     atr_slippage_mult: float = 0.1  # 10% of daily ATR
     execution_delay: int = 1  # t+1 execution
-    rebalance_frequency: Literal["daily", "weekly"] = "daily"
+    rebalance_frequency: Literal["daily", "weekly", "custom"] = "daily"
     rebalance_weekday: int = 0  # Monday
+    rebalance_weekdays: tuple[int, ...] = (0, 2, 4)
+    evaluate_exits_daily: bool = False
+    entries_on_rebalance_only: bool = False
     bad_fills_enabled: bool = False
     bad_fills_vol_threshold: float = 0.35
     bad_fills_multiplier: float = 2.0
@@ -140,6 +157,15 @@ class StrategyConfig:
     cash_sweep_asset: Literal["benchmark", "tbill"] = "benchmark"
     cash_sweep_tbill_ticker: str = "BIL"
     cash_sweep_risk_off_to_cash: bool = True
+    min_trade_weight_change: float = 0.0
+    beta_targeting_enabled: bool = False
+    beta_target_risk_on: float = 0.90
+    beta_target_neutral: float = 0.70
+    beta_target_risk_off: float = 0.25
+    beta_target_hysteresis: float = 0.05
+    beta_target_step_limit: float = 0.05
+    beta_target_stock_min: float = 0.0
+    beta_target_stock_max: float = 1.0
     
     # Backtest settings
     initial_capital: float = 1_000_000.0
@@ -157,6 +183,8 @@ class StrategyConfig:
             self.data_cache_dir = Path(self.data_cache_dir)
         if isinstance(self.sector_map_file, str):
             self.sector_map_file = Path(self.sector_map_file)
+        if isinstance(self.rebalance_weekdays, list):
+            self.rebalance_weekdays = tuple(int(x) for x in self.rebalance_weekdays)
         
         # Convert string dates to date objects
         if isinstance(self.start_date, str):
@@ -182,13 +210,29 @@ class StrategyConfig:
         assert self.slippage_bps >= 0, "slippage_bps must be non-negative"
         assert self.start_date < self.end_date, "start_date must be before end_date"
         assert self.execution_delay >= 1, "execution_delay must be at least 1 (t+1)"
-        assert self.rebalance_frequency in {"daily", "weekly"}, \
-            "rebalance_frequency must be 'daily' or 'weekly'"
+        assert self.rebalance_frequency in {"daily", "weekly", "custom"}, \
+            "rebalance_frequency must be 'daily', 'weekly', or 'custom'"
         assert 0 <= self.rebalance_weekday <= 4, "rebalance_weekday must be in [0, 4]"
+        assert len(self.rebalance_weekdays) > 0, "rebalance_weekdays must not be empty"
+        assert all(0 <= d <= 4 for d in self.rebalance_weekdays), \
+            "rebalance_weekdays entries must be in [0, 4]"
         assert self.bad_fills_vol_threshold >= 0, "bad_fills_vol_threshold must be non-negative"
         assert self.bad_fills_multiplier >= 1, "bad_fills_multiplier must be >= 1"
         assert self.cash_sweep_asset in {"benchmark", "tbill"}, \
             "cash_sweep_asset must be 'benchmark' or 'tbill'"
+        assert self.min_trade_weight_change >= 0, \
+            "min_trade_weight_change must be non-negative"
+        assert 0 <= self.beta_target_risk_on <= 1.5, "beta_target_risk_on must be in [0, 1.5]"
+        assert 0 <= self.beta_target_neutral <= 1.5, "beta_target_neutral must be in [0, 1.5]"
+        assert 0 <= self.beta_target_risk_off <= 1.5, "beta_target_risk_off must be in [0, 1.5]"
+        assert self.beta_target_hysteresis >= 0, "beta_target_hysteresis must be non-negative"
+        assert self.beta_target_step_limit >= 0, "beta_target_step_limit must be non-negative"
+        assert 0 <= self.beta_target_stock_min <= 1, \
+            "beta_target_stock_min must be in [0, 1]"
+        assert 0 <= self.beta_target_stock_max <= 1, \
+            "beta_target_stock_max must be in [0, 1]"
+        assert self.beta_target_stock_min <= self.beta_target_stock_max, \
+            "beta_target_stock_min must be <= beta_target_stock_max"
     
     def get_logger(self, name: str) -> logging.Logger:
         """Create a logger with the configured level."""
@@ -244,6 +288,9 @@ class StrategyConfig:
             "execution_delay": self.execution_delay,
             "rebalance_frequency": self.rebalance_frequency,
             "rebalance_weekday": self.rebalance_weekday,
+            "rebalance_weekdays": list(self.rebalance_weekdays),
+            "evaluate_exits_daily": self.evaluate_exits_daily,
+            "entries_on_rebalance_only": self.entries_on_rebalance_only,
             "bad_fills_enabled": self.bad_fills_enabled,
             "bad_fills_vol_threshold": self.bad_fills_vol_threshold,
             "bad_fills_multiplier": self.bad_fills_multiplier,
@@ -253,6 +300,15 @@ class StrategyConfig:
             "cash_sweep_asset": self.cash_sweep_asset,
             "cash_sweep_tbill_ticker": self.cash_sweep_tbill_ticker,
             "cash_sweep_risk_off_to_cash": self.cash_sweep_risk_off_to_cash,
+            "min_trade_weight_change": self.min_trade_weight_change,
+            "beta_targeting_enabled": self.beta_targeting_enabled,
+            "beta_target_risk_on": self.beta_target_risk_on,
+            "beta_target_neutral": self.beta_target_neutral,
+            "beta_target_risk_off": self.beta_target_risk_off,
+            "beta_target_hysteresis": self.beta_target_hysteresis,
+            "beta_target_step_limit": self.beta_target_step_limit,
+            "beta_target_stock_min": self.beta_target_stock_min,
+            "beta_target_stock_max": self.beta_target_stock_max,
             "initial_capital": self.initial_capital,
             "random_seed": self.random_seed,
             "log_level": self.log_level,
