@@ -77,6 +77,7 @@ class PortfolioConstructor:
         ranks: pd.Series,
         gate_results: dict[str, GateResults],
         current_holdings: set[str],
+        allow_new_entries: bool = True,
         volatilities: Optional[pd.Series] = None,
         regime_scale: float = 1.0,
         betas: Optional[pd.Series] = None,
@@ -91,6 +92,7 @@ class PortfolioConstructor:
             ranks: Series of ranks by ticker
             gate_results: Dict of GateResults by ticker
             current_holdings: Set of currently held tickers
+            allow_new_entries: If False, only exits/holds are allowed
             volatilities: Optional volatilities for inverse-vol weighting
             regime_scale: Global scale from market regime gate
             betas: Optional rolling beta estimate per ticker
@@ -104,7 +106,8 @@ class PortfolioConstructor:
         tickers_to_hold = self._apply_buffer_logic(
             ranks=ranks,
             gate_results=gate_results,
-            current_holdings=current_holdings
+            current_holdings=current_holdings,
+            allow_new_entries=allow_new_entries,
         )
         
         if not tickers_to_hold:
@@ -148,7 +151,8 @@ class PortfolioConstructor:
         self,
         ranks: pd.Series,
         gate_results: dict[str, GateResults],
-        current_holdings: set[str]
+        current_holdings: set[str],
+        allow_new_entries: bool = True,
     ) -> list[str]:
         """
         Apply buffer logic to determine which tickers to hold.
@@ -167,16 +171,20 @@ class PortfolioConstructor:
         """
         tickers_to_hold = []
         exit_threshold = self.top_k + self.buffer
+        # These gates must pass for a ticker to stay/enter, regardless of rank.
+        exit_priority_gates = ("liquidity", "volatility")
         
         for ticker, result in gate_results.items():
             rank = ranks.get(ticker, np.nan)
             
-            # Check if passes critical gates (excluding buffer gate)
-            critical_gates = ['liquidity', 'volatility']
-            passes_critical = all(
-                result.results.get(g, GateResults).passed 
-                for g in critical_gates if g in result.results
-            )
+            # Exit-priority check: if a critical gate fails (or is missing),
+            # force exit before applying any rank/buffer logic.
+            passes_critical = True
+            for gate_name in exit_priority_gates:
+                gate_result = result.results.get(gate_name)
+                if gate_result is None or not gate_result.passed:
+                    passes_critical = False
+                    break
             
             if not passes_critical:
                 continue
@@ -192,7 +200,7 @@ class PortfolioConstructor:
                     tickers_to_hold.append(ticker)
             else:
                 # Enter only if rank in top_k
-                if rank <= self.top_k:
+                if allow_new_entries and rank <= self.top_k:
                     tickers_to_hold.append(ticker)
         
         # Sort by rank to ensure we take best if there are ties

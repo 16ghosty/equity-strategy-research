@@ -1,0 +1,19 @@
+{
+  "ticker_file": "data/tickers.txt",
+  "start_date": "2008-01-01",
+  "end_date": "2024-12-31",
+  "top_k": 10,
+  "buffer": 10,
+  "momentum_lookback": 120,
+  "momentum_skip": 5,
+  "liquidity_threshold": 1000000,
+  "min_price": 5.0,
+  "vol_cap": 0.6,
+  "weight_scheme": "equal",
+  "max_weight": 0.1,
+  "rebalance_frequency": "weekly",
+  "rebalance_weekday": 0,
+  "evaluate_exits_daily": true,
+  "entries_on_rebalance_only": true,
+  "log_level": "INFO"
+}

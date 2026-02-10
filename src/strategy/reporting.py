@@ -844,6 +844,307 @@ def plot_benchmark_gap_decomposition(
     return fig
 
 
+def plot_benchmark_capture_ratio(
+    results: BacktestResults,
+    benchmark: Optional[pd.Series],
+    figsize: tuple = (8, 5),
+    title: str = "Benchmark Capture Ratios",
+    save_path: Optional[Path] = None,
+) -> plt.Figure:
+    """
+    Plot up/down capture ratio bars.
+    """
+    payload = _benchmark_diagnostics_payload(results, benchmark)
+    fig, ax = plt.subplots(figsize=figsize)
+
+    if not payload:
+        ax.text(0.5, 0.5, "No benchmark diagnostics available", ha="center", va="center")
+        ax.set_axis_off()
+    else:
+        labels = ["Up Capture", "Down Capture"]
+        values = [payload.get("up_capture", np.nan), payload.get("down_capture", np.nan)]
+        bars = ax.bar(labels, values, color=["#2E86AB", "#E94F37"], alpha=0.85)
+        ax.axhline(1.0, color="black", linestyle="--", linewidth=0.9, label="Parity = 1.0")
+        ax.set_ylabel("Capture Ratio")
+        ax.set_xlabel("Capture Type")
+        ax.set_title(title)
+        ax.grid(True, axis="y", alpha=0.3)
+        ax.legend(loc="best")
+        for bar, val in zip(bars, values):
+            if pd.notna(val):
+                ax.text(
+                    bar.get_x() + bar.get_width() / 2.0,
+                    float(val),
+                    f"{float(val):.2f}",
+                    ha="center",
+                    va="bottom",
+                    fontsize=9,
+                )
+
+    plt.tight_layout()
+    if save_path:
+        fig.savefig(save_path, dpi=150, bbox_inches="tight")
+    return fig
+
+
+def compute_turnover_performance_by_year(results: BacktestResults) -> pd.DataFrame:
+    """
+    Compute yearly return vs yearly turnover statistics.
+    """
+    returns = results.get_returns().dropna()
+    turnover = results.get_turnover().dropna()
+    aligned = pd.concat(
+        [returns.rename("return"), turnover.rename("turnover")],
+        axis=1,
+    ).dropna()
+    if aligned.empty:
+        return pd.DataFrame()
+
+    yearly = aligned.resample("YE").agg(
+        year_return=("return", lambda s: float((1.0 + s).prod() - 1.0)),
+        avg_daily_turnover=("turnover", "mean"),
+        annual_turnover=("turnover", "sum"),
+        trading_days=("return", "count"),
+    )
+    yearly["year"] = yearly.index.year.astype(int)
+    yearly["year_return_pct"] = yearly["year_return"] * 100.0
+    yearly["avg_daily_turnover_pct"] = yearly["avg_daily_turnover"] * 100.0
+    yearly["annual_turnover_x"] = yearly["annual_turnover"]
+    cols = [
+        "year",
+        "year_return",
+        "year_return_pct",
+        "avg_daily_turnover",
+        "avg_daily_turnover_pct",
+        "annual_turnover",
+        "annual_turnover_x",
+        "trading_days",
+    ]
+    return yearly[cols].reset_index(drop=True)
+
+
+def plot_turnover_vs_performance_by_year(
+    yearly_df: pd.DataFrame,
+    figsize: tuple = (10, 6),
+    title: str = "Turnover vs Performance by Year",
+    save_path: Optional[Path] = None,
+) -> plt.Figure:
+    """
+    Scatter chart of annual performance vs average daily turnover.
+    """
+    fig, ax = plt.subplots(figsize=figsize)
+    if yearly_df is None or yearly_df.empty:
+        ax.text(0.5, 0.5, "No yearly turnover/performance data", ha="center", va="center")
+        ax.set_axis_off()
+    else:
+        pos = yearly_df[yearly_df["year_return_pct"] >= 0]
+        neg = yearly_df[yearly_df["year_return_pct"] < 0]
+        if not pos.empty:
+            ax.scatter(
+                pos["avg_daily_turnover_pct"],
+                pos["year_return_pct"],
+                color="#2E86AB",
+                alpha=0.8,
+                label="Positive Return Year",
+            )
+        if not neg.empty:
+            ax.scatter(
+                neg["avg_daily_turnover_pct"],
+                neg["year_return_pct"],
+                color="#E94F37",
+                alpha=0.8,
+                label="Negative Return Year",
+            )
+
+        for _, row in yearly_df.iterrows():
+            ax.annotate(
+                str(int(row["year"])),
+                (row["avg_daily_turnover_pct"], row["year_return_pct"]),
+                textcoords="offset points",
+                xytext=(4, 4),
+                fontsize=8,
+            )
+
+        ax.axhline(0.0, color="black", linestyle="--", linewidth=0.8)
+        ax.set_xlabel("Average Daily Turnover (%)")
+        ax.set_ylabel("Annual Return (%)")
+        ax.set_title(title)
+        ax.grid(True, alpha=0.3)
+        ax.legend(loc="best")
+
+    plt.tight_layout()
+    if save_path:
+        fig.savefig(save_path, dpi=150, bbox_inches="tight")
+    return fig
+
+
+def compute_cost_drag_by_year(results: BacktestResults) -> pd.DataFrame:
+    """
+    Compute yearly trading-cost drag based on annual costs and average equity.
+    """
+    daily_df = pd.DataFrame(
+        [
+            {
+                "date": r.date,
+                "portfolio_value": r.portfolio_value,
+                "costs": r.costs,
+                "turnover": r.turnover,
+            }
+            for r in results.daily_results
+        ]
+    )
+    if daily_df.empty:
+        return pd.DataFrame()
+
+    daily_df["date"] = pd.to_datetime(daily_df["date"])
+    daily_df["year"] = daily_df["date"].dt.year
+    grouped = daily_df.groupby("year", as_index=False).agg(
+        total_costs=("costs", "sum"),
+        avg_equity=("portfolio_value", "mean"),
+        rebalance_events=("turnover", lambda s: int((s > 0).sum())),
+        avg_turnover=("turnover", "mean"),
+    )
+    grouped["cost_drag"] = np.where(
+        grouped["avg_equity"] > 0,
+        -(grouped["total_costs"] / grouped["avg_equity"]),
+        np.nan,
+    )
+    grouped["cost_drag_pct"] = grouped["cost_drag"] * 100.0
+    grouped["avg_turnover_pct"] = grouped["avg_turnover"] * 100.0
+    return grouped
+
+
+def plot_cost_drag_by_year(
+    yearly_df: pd.DataFrame,
+    figsize: tuple = (12, 6),
+    title: str = "Cost Drag by Year",
+    save_path: Optional[Path] = None,
+) -> plt.Figure:
+    """
+    Plot annual cost drag (%) and total costs ($) by year.
+    """
+    fig, ax1 = plt.subplots(figsize=figsize)
+    if yearly_df is None or yearly_df.empty:
+        ax1.text(0.5, 0.5, "No yearly cost data", ha="center", va="center")
+        ax1.set_axis_off()
+    else:
+        x = yearly_df["year"].astype(str)
+        ax1.bar(x, yearly_df["cost_drag_pct"], color="#E94F37", alpha=0.75, label="Cost Drag (%)")
+        ax1.axhline(0.0, color="black", linewidth=0.8, linestyle="--")
+        ax1.set_ylabel("Cost Drag (%)")
+        ax1.set_xlabel("Year")
+        ax1.grid(True, axis="y", alpha=0.3)
+        ax1.tick_params(axis="x", rotation=45)
+
+        ax2 = ax1.twinx()
+        ax2.plot(x, yearly_df["total_costs"], color="#2E86AB", marker="o", linewidth=1.8, label="Total Costs ($)")
+        ax2.set_ylabel("Total Costs ($)")
+
+        lines, labels = ax1.get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        ax1.legend(lines + lines2, labels + labels2, loc="best")
+        ax1.set_title(title)
+
+    plt.tight_layout()
+    if save_path:
+        fig.savefig(save_path, dpi=150, bbox_inches="tight")
+    return fig
+
+
+def compute_rebalance_event_costs(results: BacktestResults) -> pd.DataFrame:
+    """
+    Compute cost statistics for rebalance events (turnover/cost days).
+    """
+    daily_df = pd.DataFrame(
+        [
+            {
+                "Date": r.date,
+                "PortfolioValue": r.portfolio_value,
+                "Turnover": r.turnover,
+                "CostDollars": r.costs,
+            }
+            for r in results.daily_results
+        ]
+    )
+    if daily_df.empty:
+        return pd.DataFrame()
+
+    daily_df["Date"] = pd.to_datetime(daily_df["Date"])
+    events = daily_df[(daily_df["Turnover"] > 0) | (daily_df["CostDollars"] > 0)].copy()
+    if events.empty:
+        return pd.DataFrame()
+
+    events["TurnoverPct"] = events["Turnover"] * 100.0
+    events["CostBps"] = np.where(
+        events["PortfolioValue"] > 0,
+        (events["CostDollars"] / events["PortfolioValue"]) * 10000.0,
+        np.nan,
+    )
+    events["Year"] = events["Date"].dt.year
+    return events.sort_values("Date").reset_index(drop=True)
+
+
+def plot_rebalance_event_costs(
+    events_df: pd.DataFrame,
+    figsize: tuple = (14, 8),
+    title: str = "Cost Drag by Rebalance Events",
+    save_path: Optional[Path] = None,
+) -> plt.Figure:
+    """
+    Plot turnover-cost relationship and event cost time series.
+    """
+    fig, (ax1, ax2) = plt.subplots(
+        2,
+        1,
+        figsize=figsize,
+        gridspec_kw={"height_ratios": [1.1, 1.0]},
+    )
+    if events_df is None or events_df.empty:
+        ax1.text(0.5, 0.5, "No rebalance events available", ha="center", va="center")
+        ax1.set_axis_off()
+        ax2.set_axis_off()
+    else:
+        sc = ax1.scatter(
+            events_df["TurnoverPct"],
+            events_df["CostBps"],
+            c=events_df["CostDollars"],
+            cmap="viridis",
+            alpha=0.8,
+        )
+        cbar = fig.colorbar(sc, ax=ax1)
+        cbar.set_label("Cost ($)")
+        ax1.set_xlabel("Rebalance Turnover (%)")
+        ax1.set_ylabel("Trading Cost (bps of portfolio)")
+        ax1.set_title("Rebalance Event Cost vs Turnover")
+        ax1.grid(True, alpha=0.3)
+
+        ax2.plot(
+            events_df["Date"],
+            events_df["CostBps"],
+            color="#E94F37",
+            linewidth=1.2,
+            label="Cost per event (bps)",
+        )
+        rolling = events_df.set_index("Date")["CostBps"].rolling(20, min_periods=1).median()
+        ax2.plot(
+            rolling.index,
+            rolling.values,
+            color="#2E86AB",
+            linewidth=1.8,
+            label="Rolling median (20 events)",
+        )
+        ax2.set_xlabel("Date")
+        ax2.set_ylabel("Cost (bps)")
+        ax2.set_title(title)
+        ax2.grid(True, alpha=0.3)
+        ax2.legend(loc="best")
+
+    plt.tight_layout()
+    if save_path:
+        fig.savefig(save_path, dpi=150, bbox_inches="tight")
+    return fig
+
+
 def build_plotly_charts(
     results: BacktestResults,
     benchmark: Optional[pd.Series] = None,
@@ -1426,6 +1727,100 @@ def _attach_realized_pnl_fifo(trades: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _compute_roundtrip_trades_fifo(trades: pd.DataFrame) -> pd.DataFrame:
+    """
+    Build FIFO-matched round-trip trade records.
+
+    Each SELL is matched against prior BUY lots and expanded into one or more
+    round-trip rows with realized PnL.
+    """
+    columns = [
+        "Ticker",
+        "OpenDate",
+        "CloseDate",
+        "Shares",
+        "BuyPrice",
+        "SellPrice",
+        "RealizedPnL",
+        "ReturnPct",
+        "HoldingDays",
+    ]
+    if trades.empty:
+        return pd.DataFrame(columns=columns)
+
+    df = trades.copy()
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.sort_values(["ticker", "date"]).reset_index(drop=True)
+
+    records: list[dict] = []
+
+    for ticker, group in df.groupby("ticker", sort=False):
+        inventory: list[list] = []  # [buy_price, buy_shares, buy_date]
+
+        for _, row in group.iterrows():
+            side = str(row["side"])
+            qty = float(row["shares"])
+            px = float(row["price"])
+            dt = pd.Timestamp(row["date"])
+
+            if side == "BUY":
+                inventory.append([px, qty, dt])
+                continue
+
+            qty_to_sell = qty
+            while qty_to_sell > 1e-8 and inventory:
+                buy_px, buy_qty, buy_dt = inventory[0]
+                matched = min(qty_to_sell, buy_qty)
+                realized = matched * (px - buy_px)
+                ret_pct = ((px / buy_px) - 1.0) * 100.0 if buy_px != 0 else np.nan
+
+                records.append(
+                    {
+                        "Ticker": str(ticker),
+                        "OpenDate": buy_dt,
+                        "CloseDate": dt,
+                        "Shares": float(matched),
+                        "BuyPrice": float(buy_px),
+                        "SellPrice": float(px),
+                        "RealizedPnL": float(realized),
+                        "ReturnPct": float(ret_pct) if not pd.isna(ret_pct) else np.nan,
+                        "HoldingDays": int((dt - buy_dt).days),
+                    }
+                )
+
+                qty_to_sell -= matched
+                buy_qty -= matched
+                if buy_qty <= 1e-8:
+                    inventory.pop(0)
+                else:
+                    inventory[0][1] = buy_qty
+
+    if not records:
+        return pd.DataFrame(columns=columns)
+
+    out = pd.DataFrame(records)
+    out["OpenDate"] = pd.to_datetime(out["OpenDate"])
+    out["CloseDate"] = pd.to_datetime(out["CloseDate"])
+    return out
+
+
+def compute_worst_trades_table(
+    results: BacktestResults,
+    top_n: int = 20,
+) -> pd.DataFrame:
+    """
+    Return top-N worst FIFO round-trip trades by realized PnL.
+    """
+    roundtrips = _compute_roundtrip_trades_fifo(results.trades)
+    if roundtrips.empty:
+        return roundtrips
+
+    table = roundtrips.sort_values("RealizedPnL", ascending=True).head(top_n).copy()
+    table["OpenDate"] = table["OpenDate"].dt.strftime("%Y-%m-%d")
+    table["CloseDate"] = table["CloseDate"].dt.strftime("%Y-%m-%d")
+    return table.reset_index(drop=True)
+
+
 def compute_ticker_health_table(
     results: BacktestResults,
     price_data: pd.DataFrame,
@@ -1785,6 +2180,42 @@ def generate_full_report(
     benchmark_diagnostics = pd.DataFrame()
     ticker_health_metrics = pd.DataFrame()
     drawdown_detractor_metrics = pd.DataFrame()
+    turnover_perf_by_year = compute_turnover_performance_by_year(results)
+    cost_drag_by_year = compute_cost_drag_by_year(results)
+    rebalance_event_costs = compute_rebalance_event_costs(results)
+    rebalance_event_costs_top = pd.DataFrame()
+    worst_trades_top20 = compute_worst_trades_table(results, top_n=20)
+    if not worst_trades_top20.empty:
+        worst_trades_top20.to_csv(output_dir / "worst_trades_top20.csv", index=False)
+    if not turnover_perf_by_year.empty:
+        turnover_perf_by_year.to_csv(output_dir / "turnover_performance_by_year.csv", index=False)
+    if not cost_drag_by_year.empty:
+        cost_drag_by_year.to_csv(output_dir / "cost_drag_by_year.csv", index=False)
+    if not rebalance_event_costs.empty:
+        rebalance_event_costs.to_csv(output_dir / "rebalance_event_costs.csv", index=False)
+        rebalance_event_costs_top = (
+            rebalance_event_costs.sort_values("CostBps", ascending=False).head(50).copy()
+        )
+        rebalance_event_costs_top.to_csv(
+            output_dir / "rebalance_event_costs_top50.csv",
+            index=False,
+        )
+
+    fig = plot_turnover_vs_performance_by_year(
+        turnover_perf_by_year,
+        save_path=output_dir / "turnover_vs_performance_by_year.png",
+    )
+    plt.close(fig)
+    fig = plot_cost_drag_by_year(
+        cost_drag_by_year,
+        save_path=output_dir / "cost_drag_by_year.png",
+    )
+    plt.close(fig)
+    fig = plot_rebalance_event_costs(
+        rebalance_event_costs,
+        save_path=output_dir / "rebalance_event_costs.png",
+    )
+    plt.close(fig)
     if benchmark is not None:
         benchmark_diagnostics = compute_benchmark_diagnostics(results, benchmark)
         if not benchmark_diagnostics.empty:
@@ -1793,6 +2224,12 @@ def generate_full_report(
             results,
             benchmark,
             save_path=output_dir / "benchmark_gap_decomposition.png",
+        )
+        plt.close(fig)
+        fig = plot_benchmark_capture_ratio(
+            results,
+            benchmark,
+            save_path=output_dir / "benchmark_capture_ratio.png",
         )
         plt.close(fig)
     if price_data is not None:
@@ -1847,6 +2284,10 @@ def generate_full_report(
         benchmark_diagnostics,
         ticker_health_metrics,
         drawdown_detractor_metrics,
+        turnover_perf_by_year,
+        cost_drag_by_year,
+        rebalance_event_costs_top,
+        worst_trades_top20,
         all_stock_charts=(stock_charts_mode == "all"),
     )
     
@@ -1868,6 +2309,10 @@ def _generate_html_report(
     benchmark_diagnostics: Optional[pd.DataFrame] = None,
     ticker_health_metrics: Optional[pd.DataFrame] = None,
     drawdown_detractor_metrics: Optional[pd.DataFrame] = None,
+    turnover_perf_by_year: Optional[pd.DataFrame] = None,
+    cost_drag_by_year: Optional[pd.DataFrame] = None,
+    rebalance_event_costs_top: Optional[pd.DataFrame] = None,
+    worst_trades_top20: Optional[pd.DataFrame] = None,
     all_stock_charts: bool = False,
 ) -> str:
     """Generate HTML report content."""
@@ -1897,6 +2342,8 @@ def _generate_html_report(
         {benchmark_diag_html}
         </div>
         <img src="benchmark_gap_decomposition.png" alt="Benchmark Gap Diagnostics">
+        <h2>Benchmark Capture Ratios (Up/Down)</h2>
+        <img src="benchmark_capture_ratio.png" alt="Benchmark Capture Ratios">
         """
 
     ticker_health_html = ""
@@ -1906,6 +2353,22 @@ def _generate_html_report(
     detractor_metrics_html = ""
     if drawdown_detractor_metrics is not None and not drawdown_detractor_metrics.empty:
         detractor_metrics_html = drawdown_detractor_metrics.to_html(index=False, border=0)
+
+    turnover_perf_html = ""
+    if turnover_perf_by_year is not None and not turnover_perf_by_year.empty:
+        turnover_perf_html = turnover_perf_by_year.to_html(index=False, border=0)
+
+    cost_drag_year_html = ""
+    if cost_drag_by_year is not None and not cost_drag_by_year.empty:
+        cost_drag_year_html = cost_drag_by_year.to_html(index=False, border=0)
+
+    rebalance_event_costs_html = ""
+    if rebalance_event_costs_top is not None and not rebalance_event_costs_top.empty:
+        rebalance_event_costs_html = rebalance_event_costs_top.to_html(index=False, border=0)
+
+    worst_trades_html = ""
+    if worst_trades_top20 is not None and not worst_trades_top20.empty:
+        worst_trades_html = worst_trades_top20.to_html(index=False, border=0)
     
     timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     
@@ -1947,6 +2410,11 @@ def _generate_html_report(
         <h2>Ticker Trade Statistics</h2>
         <div style="max-height: 500px; overflow-y: auto;">
         {trade_stats_html}
+        </div>
+
+        <h2>Top 20 Worst Round-Trip Trades</h2>
+        <div style="max-height: 500px; overflow-y: auto;">
+        {worst_trades_html}
         </div>
         
         <h2>Combined Performance</h2>
@@ -1990,6 +2458,24 @@ def _generate_html_report(
         
         <h2>Turnover</h2>
         <img src="turnover.png" alt="Turnover">
+
+        <h2>Turnover vs Performance by Year</h2>
+        <img src="turnover_vs_performance_by_year.png" alt="Turnover vs Performance by Year">
+        <div style="max-height: 400px; overflow-y: auto;">
+        {turnover_perf_html}
+        </div>
+
+        <h2>Cost Drag by Year</h2>
+        <img src="cost_drag_by_year.png" alt="Cost Drag by Year">
+        <div style="max-height: 400px; overflow-y: auto;">
+        {cost_drag_year_html}
+        </div>
+
+        <h2>Cost Drag by Rebalance Events</h2>
+        <img src="rebalance_event_costs.png" alt="Cost Drag by Rebalance Events">
+        <div style="max-height: 400px; overflow-y: auto;">
+        {rebalance_event_costs_html}
+        </div>
 
         <h2>Ticker Health Metrics</h2>
         <div style="max-height: 500px; overflow-y: auto;">

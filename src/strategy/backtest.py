@@ -162,11 +162,15 @@ class Backtester:
         self.execution_model = ExecutionModel(config)
         self.rebalance_frequency = config.rebalance_frequency
         self.rebalance_weekday = config.rebalance_weekday
+        self.rebalance_weekdays = tuple(config.rebalance_weekdays)
+        self._prev_beta_target_stock_exposure: Optional[float] = None
 
     def _should_rebalance(self, dt: pd.Timestamp) -> bool:
         """Return True if strategy should generate a new signal on this date."""
         if self.rebalance_frequency == "daily":
             return True
+        if self.rebalance_frequency == "custom":
+            return dt.weekday() in set(self.rebalance_weekdays)
         return dt.weekday() == self.rebalance_weekday
 
     def _randomize_ranks(self, ranks: pd.DataFrame) -> pd.DataFrame:
@@ -230,6 +234,150 @@ class Backtester:
             else False
         )
         return bool(is_below_ma or is_high_vol)
+
+    def _apply_no_trade_band(
+        self,
+        current_weights: dict[str, float],
+        target: PortfolioTarget,
+    ) -> PortfolioTarget:
+        """
+        Suppress low-value trades by keeping prior weights for tiny deltas.
+        """
+        threshold = float(self.config.min_trade_weight_change)
+        if threshold <= 0:
+            return target
+
+        adjusted: dict[str, float] = {}
+        all_tickers = set(current_weights.keys()) | set(target.weights.keys())
+        for ticker in all_tickers:
+            old_w = float(current_weights.get(ticker, 0.0))
+            new_w = float(target.weights.get(ticker, 0.0))
+            chosen = old_w if abs(new_w - old_w) < threshold else new_w
+            if abs(chosen) > 1e-12:
+                adjusted[ticker] = chosen
+
+        gross = sum(abs(w) for w in adjusted.values())
+        if gross > self.config.max_gross_exposure and gross > 0:
+            scale = self.config.max_gross_exposure / gross
+            adjusted = {t: w * scale for t, w in adjusted.items()}
+            gross = sum(abs(w) for w in adjusted.values())
+
+        return PortfolioTarget(
+            date=target.date,
+            weights=adjusted,
+            gross_exposure=gross,
+            num_positions=len(adjusted),
+            turnover=target.turnover,
+        )
+
+    def _get_beta_target_for_regime(
+        self,
+        benchmark_price: float,
+        benchmark_ma: float,
+        benchmark_vol: float,
+    ) -> float:
+        """Map market regime to target portfolio beta."""
+        if self._is_risk_off_regime(benchmark_price, benchmark_ma, benchmark_vol):
+            return float(self.config.beta_target_risk_off)
+
+        risk_on = False
+        if not pd.isna(benchmark_price) and not pd.isna(benchmark_ma):
+            if benchmark_price >= benchmark_ma:
+                if pd.isna(benchmark_vol):
+                    risk_on = True
+                else:
+                    risk_on = benchmark_vol < (0.8 * self.config.regime_vol_threshold)
+
+        if risk_on:
+            return float(self.config.beta_target_risk_on)
+        return float(self.config.beta_target_neutral)
+
+    def _apply_beta_targeting(
+        self,
+        target: PortfolioTarget,
+        betas: pd.Series,
+        benchmark_price: float,
+        benchmark_ma: float,
+        benchmark_vol: float,
+    ) -> PortfolioTarget:
+        """
+        Scale stock-sleeve exposure so total beta tracks regime targets.
+
+        Residual capital is assumed to follow the benchmark through cash sweep.
+        """
+        if not self.config.beta_targeting_enabled:
+            return target
+        if not target.weights:
+            self._prev_beta_target_stock_exposure = 0.0
+            return target
+
+        stock_exposure = float(sum(target.weights.values()))
+        if stock_exposure <= 1e-12:
+            self._prev_beta_target_stock_exposure = stock_exposure
+            return target
+
+        stock_beta = 0.0
+        for ticker, w in target.weights.items():
+            beta = betas.get(ticker, 1.0)
+            if pd.isna(beta):
+                beta = 1.0
+            stock_beta += (w / stock_exposure) * float(beta)
+
+        current_port_beta = stock_exposure * stock_beta + (1.0 - stock_exposure)
+        beta_target = self._get_beta_target_for_regime(
+            benchmark_price=benchmark_price,
+            benchmark_ma=benchmark_ma,
+            benchmark_vol=benchmark_vol,
+        )
+        beta_error = beta_target - current_port_beta
+
+        desired_exposure = stock_exposure
+        if abs(beta_error) > float(self.config.beta_target_hysteresis):
+            denom = stock_beta - 1.0
+            if abs(denom) > 1e-8:
+                desired_exposure = (beta_target - 1.0) / denom
+
+        desired_exposure = float(
+            np.clip(
+                desired_exposure,
+                self.config.beta_target_stock_min,
+                self.config.beta_target_stock_max,
+            )
+        )
+
+        prev = (
+            stock_exposure
+            if self._prev_beta_target_stock_exposure is None
+            else float(self._prev_beta_target_stock_exposure)
+        )
+        step = float(self.config.beta_target_step_limit)
+        if step > 0:
+            delta = desired_exposure - prev
+            if abs(delta) > step:
+                desired_exposure = prev + np.sign(delta) * step
+                desired_exposure = float(
+                    np.clip(
+                        desired_exposure,
+                        self.config.beta_target_stock_min,
+                        self.config.beta_target_stock_max,
+                    )
+                )
+
+        self._prev_beta_target_stock_exposure = desired_exposure
+
+        if stock_exposure <= 1e-12:
+            return target
+
+        scale = desired_exposure / stock_exposure
+        new_weights = {t: w * scale for t, w in target.weights.items()}
+        new_gross = float(sum(abs(w) for w in new_weights.values()))
+        return PortfolioTarget(
+            date=target.date,
+            weights=new_weights,
+            gross_exposure=new_gross,
+            num_positions=len(new_weights),
+            turnover=target.turnover,
+        )
     
     def run(self, data_manager: DataManager) -> BacktestResults:
         """
@@ -244,6 +392,7 @@ class Backtester:
         self.logger.info(
             f"Starting backtest from {self.config.start_date} to {self.config.end_date}"
         )
+        self._prev_beta_target_stock_exposure = None
         
         # Get data
         close_prices = data_manager.get_close_prices()
@@ -425,7 +574,11 @@ class Backtester:
             # Generate signal for tomorrow (use today's close)
             universe = universe_df.loc[dt, 'universe'] if dt in universe_df.index else []
             
-            if len(universe) > 0 and self._should_rebalance(dt):
+            should_rebalance = self._should_rebalance(dt)
+            should_evaluate_signals = should_rebalance or self.config.evaluate_exits_daily
+            allow_new_entries = should_rebalance or (not self.config.entries_on_rebalance_only)
+
+            if len(universe) > 0 and should_evaluate_signals:
                 # Get features for today
                 prices_today = close_prices.loc[dt]
                 vols_today = volatilities.loc[dt] if dt in volatilities.index else pd.Series()
@@ -464,11 +617,23 @@ class Backtester:
                     ranks=ranks_today,
                     gate_results=gate_results,
                     current_holdings=set(state.positions.keys()),
+                    allow_new_entries=allow_new_entries,
                     volatilities=vols_today,
                     regime_scale=regime_scale,
                     betas=betas_today,
                     sector_map=sector_map,
                     current_drawdown=current_drawdown,
+                )
+                pending_target = self._apply_no_trade_band(
+                    current_weights=state.weights,
+                    target=pending_target,
+                )
+                pending_target = self._apply_beta_targeting(
+                    target=pending_target,
+                    betas=betas_today,
+                    benchmark_price=bm_price,
+                    benchmark_ma=bm_ma,
+                    benchmark_vol=bm_vol,
                 )
             else:
                 pending_target = None

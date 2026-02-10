@@ -142,6 +142,24 @@ class TestPortfolioConstructor:
         
         # AMZN (rank 4) should NOT enter (not in current holdings, rank > top_k)
         assert 'AMZN' not in portfolio.weights
+
+    def test_allow_new_entries_false_blocks_fresh_entries(
+        self, config, sample_ranks, sample_gate_results
+    ):
+        """Non-rebalance days should allow exits/holds but block new entries."""
+        constructor = PortfolioConstructor(config)
+
+        portfolio = constructor.construct_portfolio(
+            date=pd.Timestamp("2024-01-15"),
+            ranks=sample_ranks,
+            gate_results=sample_gate_results,
+            current_holdings={"AMZN"},
+            allow_new_entries=False,
+        )
+
+        assert "AMZN" in portfolio.weights
+        assert "AAPL" not in portfolio.weights
+        assert "MSFT" not in portfolio.weights
     
     def test_max_weight_constraint(self, config, sample_ranks, sample_gate_results):
         """Test that max weight constraint is applied."""
@@ -183,6 +201,32 @@ class TestPortfolioConstructor:
         
         # AAPL should be excluded despite being rank 1
         assert 'AAPL' not in portfolio.weights
+
+    def test_gate_failure_forces_exit_even_within_buffer(
+        self, config, sample_ranks, sample_gate_results
+    ):
+        """Critical gate failure should override buffer hold behavior."""
+        # AMZN rank=4 is within exit buffer for top_k=3, buffer=2.
+        sample_gate_results["AMZN"] = GateResults(
+            ticker="AMZN",
+            date=pd.Timestamp("2024-01-15"),
+            results={
+                "liquidity": GateResult(True, "ok"),
+                "volatility": GateResult(False, "vol_exceeds_60%"),
+                "regime": GateResult(True, "risk_on", scale=1.0),
+            },
+        )
+
+        constructor = PortfolioConstructor(config)
+        portfolio = constructor.construct_portfolio(
+            date=pd.Timestamp("2024-01-15"),
+            ranks=sample_ranks,
+            gate_results=sample_gate_results,
+            current_holdings={"AMZN"},
+        )
+
+        # Must exit despite rank being inside buffer because gate failure is higher priority.
+        assert "AMZN" not in portfolio.weights
     
     def test_volatility_sizing(self, config, sample_ranks, sample_gate_results):
         """Test that volatility sizing scales weights."""

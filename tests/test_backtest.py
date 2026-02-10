@@ -17,6 +17,7 @@ from strategy.backtest import (
     BacktestResults,
     DailyResult,
 )
+from strategy.portfolio import PortfolioTarget
 
 
 @pytest.fixture
@@ -192,6 +193,15 @@ class TestBacktester:
         assert backtester._should_rebalance(pd.Timestamp("2024-01-15"))  # Monday
         assert not backtester._should_rebalance(pd.Timestamp("2024-01-16"))  # Tuesday
 
+    def test_should_rebalance_custom_weekdays(self, config):
+        """Custom rebalance should signal only on configured weekday set."""
+        config.rebalance_frequency = "custom"
+        config.rebalance_weekdays = (0, 2, 4)  # Mon/Wed/Fri
+        backtester = Backtester(config)
+        assert backtester._should_rebalance(pd.Timestamp("2024-01-15"))  # Monday
+        assert not backtester._should_rebalance(pd.Timestamp("2024-01-16"))  # Tuesday
+        assert backtester._should_rebalance(pd.Timestamp("2024-01-17"))  # Wednesday
+
     def test_cash_sweep_applies_benchmark_return(self, config):
         """Positive cash should earn benchmark return when cash sweep is enabled."""
         config.cash_sweep_to_benchmark = True
@@ -268,6 +278,51 @@ class TestBacktester:
         )
 
         assert swept_cash == pytest.approx(100_000.0)
+
+    def test_no_trade_band_keeps_small_weight_changes(self, config):
+        """Small target deltas should be suppressed by no-trade band."""
+        config.min_trade_weight_change = 0.01
+        backtester = Backtester(config)
+        target = PortfolioTarget(
+            date=pd.Timestamp("2024-01-15"),
+            weights={"AAPL": 0.105, "MSFT": 0.191},
+            gross_exposure=0.296,
+            num_positions=2,
+        )
+        current = {"AAPL": 0.10, "MSFT": 0.20}
+
+        adjusted = backtester._apply_no_trade_band(current_weights=current, target=target)
+
+        assert adjusted.weights["AAPL"] == pytest.approx(0.10)
+        assert adjusted.weights["MSFT"] == pytest.approx(0.20)
+
+    def test_beta_targeting_scales_stock_sleeve(self, config):
+        """Beta targeting should reduce stock sleeve when beta target is lower."""
+        config.beta_targeting_enabled = True
+        config.beta_target_risk_on = 0.8
+        config.beta_target_neutral = 0.8
+        config.beta_target_risk_off = 0.8
+        config.beta_target_hysteresis = 0.0
+        config.beta_target_step_limit = 1.0
+        backtester = Backtester(config)
+
+        target = PortfolioTarget(
+            date=pd.Timestamp("2024-01-15"),
+            weights={"AAPL": 0.30, "MSFT": 0.30},
+            gross_exposure=0.60,
+            num_positions=2,
+        )
+        betas = pd.Series({"AAPL": 1.5, "MSFT": 1.5}, dtype=float)
+
+        adjusted = backtester._apply_beta_targeting(
+            target=target,
+            betas=betas,
+            benchmark_price=100.0,
+            benchmark_ma=90.0,
+            benchmark_vol=0.10,
+        )
+
+        assert sum(adjusted.weights.values()) < sum(target.weights.values())
 
 
 # Note: Integration test with real data would require DataManager setup
